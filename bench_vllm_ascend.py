@@ -81,12 +81,6 @@ def main():
             parser.exit(1, f"Could not locate vLLM Ascend custom ops: {exc}\n")
 
     import torch
-    if args.backend != "tilelang":
-        try:
-            prepare_vllm_opp()
-        except ImportError as exc:
-            parser.exit(1, f"Could not locate vLLM Ascend custom ops: {exc}\n")
-
     import torch_npu  # noqa: F401
 
     from fgw_mhc import mhc_post, mhc_pre
