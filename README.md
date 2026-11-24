@@ -37,3 +37,25 @@ bash run_npu.sh --device npu:0 --output results.csv
 ```bash
 bash run_npu.sh --baseline-module my_ascendc_mhc --output ascendc-results.csv
 ```
+
+
+## vLLM AscendC 对照
+
+在同一个 Python 环境中安装带 Ascend 950（A5）自定义算子扩展的 vLLM Ascend，
+确认该构建提供 `npu_hc_pre_v2` 和 `npu_hc_post`。脚本按
+[vLLM 的算子测试](https://github.com/vllm-project/vllm-ascend/blob/85a13ed4c3269f8f8e5e8328ce932e199f54244f/tests/e2e/nightly/single_node/ops/singlecard_ops/test_hc_pre.py)
+的方式注册扩展。
+
+```bash
+python bench_vllm_ascend.py --device npu:0 --output vllm-ascend-results.csv
+```
+
+默认沿用三组 TileOPs shape，双方都执行 20 次 Sinkhorn。两条路径使用相同的
+输入、权重和固定的层输出，分别计时 Pre + Post；跳过中间的 Attention/MLP。
+预生成数据、权重布局转换和首次编译在计时区间外。
+`vllm_over_tilelang_speedup` 为 vLLM AscendC 中位延时除以 TileLang 中位延时。
+
+FGW-mHC 在 Pre 混合残差，vLLM 在 Post 混合残差。两条原生路径的 RMS、
+Sinkhorn、矩阵方向、投影精度和 BF16 舍入位置有差异。CSV 记录最大绝对差，
+配对延时用于比较各自的原生实现。若 vLLM 拒绝某个 shape，脚本会报出该组
+shape，并保留已完成的行。
