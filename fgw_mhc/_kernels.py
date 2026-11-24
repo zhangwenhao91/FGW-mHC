@@ -36,12 +36,75 @@ def project(x, phi, partial, *, batch: int, width: int, chunk: int):
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
+def prepare_cube(x, promoted, squares, *, batch: int, width: int, chunk: int):
+    """Promote BF16 activations and publish split-K RMS statistics."""
+    splits = width // chunk
+    x: T.Tensor[(batch, width), T.bfloat16]
+    promoted: T.Tensor[(batch, width), T.float32]
+    squares: T.Tensor[(batch, splits, 8), T.float32]
+
+    cores = min(batch * splits, 56)
+    with T.Kernel(cores) as core:
+        x_ub = T.alloc_shared((chunk,), T.bfloat16)
+        promoted_ub = T.alloc_shared((chunk,), T.float32)
+        squares_ub = T.alloc_shared((8,), T.float32)
+        for token, part in T.Persistent([batch, splits], cores, core, group_size=1):
+            start = part * chunk
+            T.copy(x[token, start], x_ub)
+            with T.SimtVF(threads=32):
+                for k in T.Parallel(chunk):
+                    promoted_ub[k] = T.Cast(T.float32, x_ub[k])
+                for lane in T.Parallel(8):
+                    total = T.alloc_var(T.float32, init=0.0)
+                    for k in T.serial(chunk // 8):
+                        value = T.Cast(T.float32, x_ub[k * 8 + lane])
+                        total += value * value
+                    squares_ub[lane] = total
+            T.copy(promoted_ub, promoted[token, start])
+            T.copy(squares_ub, squares[token, part, 0])
+
+
+@tilelang.jit(target="ascend", execution_backend="tvm_ffi")
+def project_cube(x, phi, partial, *, batch: int, width: int, chunk: int):
+    """Split-K HF32 projection with FP32 accumulation on Cube."""
+    splits = width // chunk
+    rows = 16
+    cols = 32
+    row_tiles = (batch + rows - 1) // rows
+    x: T.Tensor[(batch, width), T.float32]
+    phi: T.Tensor[(width, 24), T.float32]
+    partial: T.Tensor[(splits, row_tiles * rows, cols), T.float32]
+
+    cores = min(row_tiles * splits, 28)
+    with T.Kernel(cores) as core:
+        a_l1 = T.alloc_l1((rows, chunk), T.float32)
+        b_l1 = T.alloc_l1((chunk, cols), T.float32)
+        a_l0 = T.alloc_l0a((rows, chunk), T.float32)
+        b_l0 = T.alloc_l0b((cols, chunk), T.float32)
+        acc = T.alloc_l0c((rows, cols), T.float32)
+        T.set_hf32_mode("nearest_even")
+        for part, row_tile in T.Persistent([splits, row_tiles], cores, core, group_size=1):
+            k = part * chunk
+            m = row_tile * rows
+            # Bounds-aware loads zero-pad partial M tiles and the last 8 phi columns.
+            T.copy(x[m:m + rows, k:k + chunk], a_l1)
+            T.copy(phi[k:k + chunk, 0:cols], b_l1)
+            T.copy(a_l1, a_l0)
+            T.copy(b_l1, b_l0, transpose=True)
+            T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=True)
+            T.copy(acc, partial[part, m:m + rows, 0:cols])
+
+
+@tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def mix(
-    partial, bias, weights, h_post, *,
+    partial, squares, bias, weights, h_post, *,
     batch: int, width: int, splits: int, repeat: int, eps: float,
-    alpha_pre: float, alpha_post: float, alpha_res: float,
+    alpha_pre: float, alpha_post: float, alpha_res: float, cube: bool,
 ):
-    partial: T.Tensor[(batch, splits, 32), T.float32]
+    shape = (splits, (batch + 15) // 16 * 16, 32) if cube else (batch, splits, 32)
+    squares_shape = (batch, splits, 8) if cube else shape
+    partial: T.Tensor[shape, T.float32]
+    squares: T.Tensor[squares_shape, T.float32]
     bias: T.Tensor[(24,), T.float32]
     weights: T.Tensor[(batch, 24), T.float32]
     h_post: T.Tensor[(batch, 4), T.float32]
@@ -49,18 +112,29 @@ def mix(
     cores = min(batch, 56)
     with T.Kernel(cores) as core:
         partial_ub = T.alloc_shared((splits, 32), T.float32)
+        if cube:
+            squares_ub = T.alloc_shared((splits, 8), T.float32)
         bias_ub = T.alloc_shared((24,), T.float32)
         totals = T.alloc_shared((32,), T.float32)
         weights_ub = T.alloc_shared((24,), T.float32)
         post_ub = T.alloc_shared((8,), T.float32)
         for token in T.Persistent([batch], cores, core, group_size=1):
-            T.copy(partial[token, 0, 0], partial_ub)
+            if cube:
+                T.copy(partial[0:splits, token, 0:32], partial_ub)
+                T.copy(squares[token, 0, 0], squares_ub)
+            else:
+                T.copy(partial[token, 0, 0], partial_ub)
             T.copy(bias, bias_ub)
             with T.SimtVF(threads=32):
                 for q in T.Parallel(32):
                     value = T.alloc_var(T.float32, init=0.0)
-                    for split in T.serial(splits):
-                        value += partial_ub[split, q]
+                    if cube and q == 24:
+                        for split in T.serial(splits):
+                            for lane in T.unroll(8):
+                                value += squares_ub[split, lane]
+                    else:
+                        for split in T.serial(splits):
+                            value += partial_ub[split, q]
                     totals[q] = value
             with T.SimtVF(threads=32):
                 for lane in T.Parallel(1):

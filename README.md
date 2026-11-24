@@ -91,3 +91,20 @@ python bench_vllm_ascend.py --merge tilelang-pair.csv vllm-pair.csv --output vll
 
 合并时会校验两个 CSV 的三组 shape、Sinkhorn 次数、预热和重复次数。分环境结果只报告
 延时和加速比，CANN、PyTorch 与运行时版本可能随环境而异。同进程模式仍可记录输出差异。
+
+
+## Cube 投影实验
+
+`mhc_pre(..., projection="cube")` 将 `x @ phi` 改为 Ascend Cube 的 split-K
+HF32 GEMM，累加为 FP32。Vector 预处理在一次启动里提升 BF16 输入并计算
+分块平方和。随后 Cube 写出分块投影，复用后面的门控、Sinkhorn 和残差混合。
+Pre 共四次启动，计时包含 BF16 提升和 workspace 开销。默认仍为已验证的
+Vector 投影。两个路径都遵循 TileOPs 的非 shifted 接口。
+
+```bash
+python -m pytest -q tests/test_mhc.py
+python bench_vllm_ascend.py --backend tilelang --projection cube --device npu:0 \
+  --output tilelang-cube-pair.csv
+python bench_vllm_ascend.py --merge tilelang-cube-pair.csv vllm-pair.csv \
+  --output vllm-ascend-cube-results.csv
+```

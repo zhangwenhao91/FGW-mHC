@@ -31,11 +31,15 @@ def _compile(stage, **config):
     return getattr(_kernels, stage).compile(**config)
 
 
-def mhc_pre(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkhorn_eps=0.02):
+def mhc_pre(
+    phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat,
+    sinkhorn_eps=0.02, *, projection="vector",
+):
     """Return (x_res, x_layer, h_post) for four residual streams.
 
     Input x is BF16 [B, 4*H]. Phi and bias are FP32 [4*H, 24] and [24].
-    H must be divisible by 64.
+    H must be divisible by 64. The optional Cube projection uses HF32
+    multiplication with FP32 accumulation.
     """
     batch, width = _check_input(x)
     if width % 256:
@@ -48,10 +52,15 @@ def mhc_pre(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkho
     _check_tensor("phi", phi, (width, 24), torch.float32, device)
     _check_tensor("b", b, (24,), torch.float32, device)
 
+    if projection not in ("vector", "cube"):
+        raise ValueError("projection must be 'vector' or 'cube'")
+    cube = projection == "cube"
     chunk = gcd(width, 256)
     splits = width // chunk
     tile = gcd(hidden, 256)
-    projection = _compile("project", batch=batch, width=width, chunk=chunk)
+    projection_kernel = _compile(
+        "project_cube" if cube else "project", batch=batch, width=width, chunk=chunk
+    )
     mixing = _compile(
         "mix",
         batch=batch,
@@ -62,16 +71,27 @@ def mhc_pre(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkho
         alpha_pre=float(alpha_pre),
         alpha_post=float(alpha_post),
         alpha_res=float(alpha_res),
+        cube=cube,
     )
     apply = _compile("apply_mix", batch=batch, hidden=hidden, tile=tile)
-    partial = torch.empty((batch, splits, 32), device=device, dtype=torch.float32)
+    partial_shape = (splits, (batch + 15) // 16 * 16, 32) if cube else (batch, splits, 32)
+    partial = torch.empty(partial_shape, device=device, dtype=torch.float32)
     weights = torch.empty((batch, 24), device=device, dtype=torch.float32)
     x_res = torch.empty_like(x)
     x_layer = torch.empty((batch, hidden), device=device, dtype=torch.bfloat16)
     h_post = torch.empty((batch, 4), device=device, dtype=torch.float32)
 
-    projection(x, phi, partial)
-    mixing(partial, b, weights, h_post)
+    if cube:
+        prepare = _compile("prepare_cube", batch=batch, width=width, chunk=chunk)
+        promoted = torch.empty((batch, width), device=device, dtype=torch.float32)
+        squares = torch.empty((batch, splits, 8), device=device, dtype=torch.float32)
+        prepare(x, promoted, squares)
+        projection_kernel(promoted, phi, partial)
+    else:
+        projection_kernel(x, phi, partial)
+        # The Vector specialization reads its RMS statistics from partial.
+        squares = partial
+    mixing(partial, squares, b, weights, h_post)
     apply(x.view(batch, 4, hidden), weights, x_res.view(batch, 4, hidden), x_layer)
     return x_res, x_layer, h_post
 

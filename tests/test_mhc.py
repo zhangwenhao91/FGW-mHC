@@ -16,7 +16,8 @@ def device():
 
 
 @pytest.mark.parametrize("batch,hidden,repeat", [(1, 1280, 1), (2, 1920, 1), (4, 2560, 1), (3, 64, 20)])
-def test_pre_post(device, batch, hidden, repeat):
+@pytest.mark.parametrize("projection", ["vector", "cube"])
+def test_pre_post(device, batch, hidden, repeat, projection):
     rng = torch.Generator().manual_seed(42)
     x = torch.randn(batch, 4 * hidden, generator=rng).bfloat16()
     phi = torch.randn(4 * hidden, 24, generator=rng)
@@ -24,7 +25,7 @@ def test_pre_post(device, batch, hidden, repeat):
     args = (0.7, -0.3, 0.5, repeat, 0.02)
 
     expected = pre_reference(phi, x, bias, *args)
-    actual = mhc_pre(phi.to(device), x.to(device), bias.to(device), *args)
+    actual = mhc_pre(phi.to(device), x.to(device), bias.to(device), *args, projection=projection)
     for output, ref in zip(actual, expected):
         torch.testing.assert_close(output.cpu(), ref, atol=0.01, rtol=0.01)
 

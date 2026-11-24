@@ -12,11 +12,17 @@ from bench_mhc import CASES, time_us
 
 def merge_results(tilelang_path, vllm_path, output_path):
     tables = []
+    projection = "vector"
     for path, backend in ((tilelang_path, "tilelang"), (vllm_path, "vllm")):
         with path.open(newline="", encoding="utf-8") as source:
             rows = list(csv.DictReader(source))
         if len(rows) != len(CASES) or any(row["backend"] != backend for row in rows):
             raise ValueError(f"{path} must contain all {len(CASES)} cases for {backend}")
+        if backend == "tilelang":
+            projections = {row.get("projection", "vector") for row in rows}
+            if len(projections) != 1:
+                raise ValueError(f"{path} mixes TileLang projection modes")
+            (projection,) = projections
         table = {}
         for row in rows:
             latency = float(row["pair_us"])
@@ -34,9 +40,9 @@ def merge_results(tilelang_path, vllm_path, output_path):
     with output_path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
         writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat",
-                         "tilelang_pair_us", "vllm_ascendc_pair_us", "vllm_over_tilelang_speedup"))
+                         "tilelang_projection", "tilelang_pair_us", "vllm_ascendc_pair_us", "vllm_over_tilelang_speedup"))
         for key, latency in tilelang.items():
-            writer.writerow((*key, f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
+            writer.writerow((*key, projection, f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
 
 
 def prepare_vllm_opp():
@@ -57,6 +63,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--repeat", type=int, default=100)
+    parser.add_argument("--projection", choices=("vector", "cube"), default="vector")
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
     parser.add_argument("--list-cases", action="store_true")
@@ -105,10 +112,10 @@ def main():
     with args.output.open("w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
         if args.backend != "both":
-            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "pair_us"))
+            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "pair_us"))
         else:
             writer.writerow((
-                "batch", "hidden", "sinkhorn_iters", "tilelang_pair_us", "vllm_ascendc_pair_us",
+                "batch", "hidden", "sinkhorn_iters", "tilelang_projection", "tilelang_pair_us", "vllm_ascendc_pair_us",
                 "vllm_over_tilelang_speedup", "layer_max_abs_diff", "h_post_max_abs_diff",
                 "native_pair_output_max_abs_diff",
             ))
@@ -127,7 +134,7 @@ def main():
             vllm_args = (vllm_x, vllm_phi, scale, bias, 4, args.sinkhorn_iters, eps, eps)
 
             def tilelang_pair():
-                residual, layer_in, post = mhc_pre(*pre_args)
+                residual, layer_in, post = mhc_pre(*pre_args, projection=args.projection)
                 return layer_in, post, mhc_post(layer_out, post, residual)
 
             def vllm_pair():
@@ -154,7 +161,7 @@ def main():
                 if not math.isfinite(latency) or latency <= 0:
                     raise RuntimeError(f"Invalid event time for B={batch}, hidden={hidden}")
                 writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
-                                 args.warmup, args.repeat, f"{latency:.6f}"))
+                                 args.warmup, args.repeat, args.projection if args.backend == "tilelang" else "", f"{latency:.6f}"))
                 output.flush()
                 print(f"{args.backend} B={batch} hidden={hidden}: {latency:.3f} us", flush=True)
                 continue
@@ -169,7 +176,7 @@ def main():
                 raise RuntimeError(f"Invalid event time for B={batch}, hidden={hidden}")
             speedup = vllm_us / tilelang_us
             writer.writerow((
-                batch, hidden, args.sinkhorn_iters, f"{tilelang_us:.3f}", f"{vllm_us:.3f}",
+                batch, hidden, args.sinkhorn_iters, args.projection, f"{tilelang_us:.3f}", f"{vllm_us:.3f}",
                 f"{speedup:.3f}", *(f"{diff:.6g}" for diff in diffs),
             ))
             output.flush()
