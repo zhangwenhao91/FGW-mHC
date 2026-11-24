@@ -64,6 +64,8 @@ def mix(
                     totals[q] = value
             with T.SimtVF(threads=32):
                 for lane in T.Parallel(1):
+                    # Sinkhorn is serial within this lane. Publish only final weights to UB.
+                    residual = T.alloc_local((16,), T.float32)
                     norm = T.sqrt(totals[24] / width) + 0.0001
                     for i in T.serial(4):
                         pre = alpha_pre * totals[i] / norm + bias_ub[i]
@@ -71,28 +73,30 @@ def mix(
                         weights_ub[i] = 1.0 / (1.0 + T.exp(-pre))
                         post_ub[i] = 2.0 / (1.0 + T.exp(-post))
                     for i in T.serial(4):
-                        row = 4 + i * 4
+                        row = i * 4
                         for j in T.serial(4):
                             q = 8 + i * 4 + j
-                            weights_ub[row + j] = alpha_res * totals[q] / norm + bias_ub[q]
-                        row_max = T.alloc_var(T.float32, init=weights_ub[row])
+                            residual[row + j] = alpha_res * totals[q] / norm + bias_ub[q]
+                        row_max = T.alloc_var(T.float32, init=residual[row])
                         for j in T.serial(1, 4):
-                            row_max = T.max(row_max, weights_ub[row + j])
+                            row_max = T.max(row_max, residual[row + j])
                         for j in T.serial(4):
-                            weights_ub[row + j] = T.exp(weights_ub[row + j] - row_max)
+                            residual[row + j] = T.exp(residual[row + j] - row_max)
                     for iteration in T.serial(repeat):
                         for i in T.serial(4):
                             row_sum = T.alloc_var(T.float32, init=0.0)
                             for j in T.serial(4):
-                                row_sum += weights_ub[4 + i * 4 + j]
+                                row_sum += residual[i * 4 + j]
                             for j in T.serial(4):
-                                weights_ub[4 + i * 4 + j] /= row_sum + eps
+                                residual[i * 4 + j] /= row_sum + eps
                         for j in T.serial(4):
                             col_sum = T.alloc_var(T.float32, init=0.0)
                             for i in T.serial(4):
-                                col_sum += weights_ub[4 + i * 4 + j]
+                                col_sum += residual[i * 4 + j]
                             for i in T.serial(4):
-                                weights_ub[4 + i * 4 + j] /= col_sum + eps
+                                residual[i * 4 + j] /= col_sum + eps
+                    for i in T.serial(16):
+                        weights_ub[4 + i] = residual[i]
                     for i in T.serial(20, 24):
                         weights_ub[i] = 0.0
             T.copy(weights_ub, weights[token, 0])
