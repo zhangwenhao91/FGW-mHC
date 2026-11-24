@@ -3,6 +3,8 @@
 import argparse
 import csv
 import math
+import os
+from importlib.util import find_spec
 from pathlib import Path
 
 from bench_mhc import CASES, time_us
@@ -37,6 +39,19 @@ def merge_results(tilelang_path, vllm_path, output_path):
             writer.writerow((*key, f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
 
 
+def prepare_vllm_opp():
+    """Expose packaged OPP metadata before torch_npu initializes CANN."""
+    spec = find_spec("vllm_ascend")
+    if spec is None or spec.origin is None:
+        raise ImportError("vllm_ascend is not installed")
+    vendors = Path(spec.origin).parent / "_cann_ops_custom" / "vendors"
+    paths = sorted(str(path) for path in vendors.glob("*") if path.is_dir())
+    existing = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep)
+    os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(
+        dict.fromkeys(path for path in (*paths, *existing) if path)
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
@@ -59,14 +74,25 @@ def main():
     if min(args.warmup, args.repeat, args.sinkhorn_iters) < 1:
         parser.error("warmup, repeat and sinkhorn iterations must be positive")
 
+    if args.backend != "tilelang":
+        try:
+            prepare_vllm_opp()
+        except ImportError as exc:
+            parser.exit(1, f"Could not locate vLLM Ascend custom ops: {exc}\n")
+
     import torch
+    if args.backend != "tilelang":
+        try:
+            prepare_vllm_opp()
+        except ImportError as exc:
+            parser.exit(1, f"Could not locate vLLM Ascend custom ops: {exc}\n")
+
     import torch_npu  # noqa: F401
 
     from fgw_mhc import mhc_post, mhc_pre
     from fgw_mhc.reference import post_reference, pre_reference
 
     device = torch.device(args.device)
-    torch.npu.set_device(device)
     if args.backend != "tilelang":
         try:
             from vllm_ascend.utils import bootstrap_custom_op_env
@@ -79,6 +105,7 @@ def main():
         except (ImportError, OSError, AttributeError) as exc:
             parser.exit(1, f"Could not load vLLM Ascend A5 HcPre/HcPost custom ops: {exc}\n")
 
+    torch.npu.set_device(device)
     eps = 1e-6
     rng = torch.Generator().manual_seed(42)
     with args.output.open("w", encoding="utf-8", newline="") as output:
