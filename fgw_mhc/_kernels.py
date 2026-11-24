@@ -3,6 +3,7 @@
 import tilelang
 import tilelang.ascend.language as T
 from tilelang.ascend.language import simd as S
+from tilelang.layout import make_ascend_compact_nz_layout
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
@@ -96,13 +97,79 @@ def project_cube(x, phi, partial, *, batch: int, width: int, chunk: int):
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
+def project_cube_fused(x, phi, partial, squares, *, batch: int, width: int, chunk: int, cores: int):
+    """Prepare X on paired Vector cores and feed Cube without a GM conversion buffer."""
+    splits = width // chunk
+    rows = 16
+    half = rows // 2
+    cols = 32
+    row_tiles = (batch + rows - 1) // rows
+    jobs = row_tiles * splits
+    x: T.Tensor[(batch, width), T.bfloat16]
+    phi: T.Tensor[(width, 24), T.float32]
+    partial: T.Tensor[(splits, row_tiles * rows, cols), T.float32]
+    squares: T.Tensor[(splits, row_tiles * rows, 8), T.float32]
+
+    with T.MixedKernel(cores) as (core, side):
+        x_ub = T.alloc_shared((half, chunk), T.bfloat16)
+        nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
+        T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
+        squares_ub = T.alloc_shared((half, 8), T.float32)
+        a_l1 = T.alloc_l1((rows, chunk), T.float32)
+        b_l1 = T.alloc_l1((chunk, cols), T.float32)
+        a_l0 = T.alloc_l0a((rows, chunk), T.float32)
+        b_l0 = T.alloc_l0b((cols, chunk), T.float32)
+        acc = T.alloc_l0c((rows, cols), T.float32)
+
+        T.set_hf32_mode("nearest_even")
+        for step in T.Pipelined(jobs // cores):
+            job = step * cores + core
+            part = job // row_tiles
+            m = job % row_tiles * rows
+            k = part * chunk
+            vector_m = m + side * half
+            # The tail load zero-pads any rows outside the real batch.
+            T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
+            T.copy(phi[k:k + chunk, 0:cols], b_l1)
+            with T.SimdVF():
+                full = S.pset(32)
+                first = S.pset(32, "PAT_VL1")
+                eight = S.pset(32, "PAT_VL8")
+                zero = S.vdup(T.float32(0), T.float32, full)
+                nz_stride = T.int32((half + 1) << 16)
+                for row in T.serial(half):
+                    squared = S.alloc_local((1,), T.float32)
+                    squared[0] = zero
+                    for col_tile in T.unroll(chunk // 64, explicit=True):
+                        col = col_tile * 64
+                        values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
+                        ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                        S.vsstb(values, ptr, nz_stride, full)
+                        S.vmula(squared[0], values, values, full)
+                    total = S.vcadd(squared[0], full)
+                    S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
+            # Both Vector halves publish their rows to the same Cube L1 tile.
+            T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
+            T.copy(squares_ub, squares[part, vector_m:vector_m + half, 0:8])
+            T.copy(a_l1, a_l0)
+            T.copy(b_l1, b_l0, transpose=True)
+            T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=True)
+            T.copy(acc, partial[part, m:m + rows, 0:cols])
+
+
+@tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def mix(
     partial, squares, bias, weights, h_post, *,
     batch: int, width: int, splits: int, repeat: int, eps: float,
-    alpha_pre: float, alpha_post: float, alpha_res: float, cube: bool,
+    alpha_pre: float, alpha_post: float, alpha_res: float, cube: bool, fused: bool,
 ):
     shape = (splits, (batch + 15) // 16 * 16, 32) if cube else (batch, splits, 32)
-    squares_shape = (batch, splits, 8) if cube else shape
+    if fused:
+        squares_shape = (splits, shape[1], 8)
+    elif cube:
+        squares_shape = (batch, splits, 8)
+    else:
+        squares_shape = shape
     partial: T.Tensor[shape, T.float32]
     squares: T.Tensor[squares_shape, T.float32]
     bias: T.Tensor[(24,), T.float32]
@@ -121,7 +188,10 @@ def mix(
         for token in T.Persistent([batch], cores, core, group_size=1):
             if cube:
                 T.copy(partial[0:splits, token, 0:32], partial_ub)
-                T.copy(squares[token, 0, 0], squares_ub)
+                if fused:
+                    T.copy(squares[0:splits, token, 0:8], squares_ub)
+                else:
+                    T.copy(squares[token, 0, 0], squares_ub)
             else:
                 T.copy(partial[token, 0, 0], partial_ub)
             T.copy(bias, bias_ub)
@@ -130,8 +200,11 @@ def mix(
                     value = T.alloc_var(T.float32, init=0.0)
                     if cube and q == 24:
                         for split in T.serial(splits):
-                            for lane in T.unroll(8):
-                                value += squares_ub[split, lane]
+                            if fused:
+                                value += squares_ub[split, 0]
+                            else:
+                                for lane in T.unroll(8):
+                                    value += squares_ub[split, lane]
                     else:
                         for split in T.serial(splits):
                             value += partial_ub[split, q]

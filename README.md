@@ -5,7 +5,7 @@ Ascend 950 的 TileOPs mHC 前向算子原型。支持四条残差流、BF16 激
 - `mhc_pre(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkhorn_eps=0.02)` 返回 `(x_res, x_layer, h_post)`。Pre 分三次启动，在 NPU 上完成分块投影和平方和、门控和 Sinkhorn、残差和层输入投影。
 - `mhc_post(x_layer_out, h_post, x_res)` 以 FP32 计算广播乘加，返回 BF16 的 `[B, 4 * H]`。输入 `x_res` 由 Pre 完成残差混合。
 
-实现参照 [tilelang-asc PR #25](https://github.com/yangsichan/tilelang-asc/pull/25) 的 Ascend 方言、Vector 分块与 JIT 编译方式，计算遵循 [TileOPs mHC 参考](https://github.com/yyttt6/TileOPs/blob/ea0d2999a830243fd398e74bb30427a064078bac/workloads/sequence_modeling/mhc.py) 的非 shifted 语义。Pre 第一版使用 Vector SIMT 投影，后续可用 Cube 实现相同计算边界。JIT 缓存按输入形状和 Pre 标量参数特化。
+实现参照 [tilelang-asc PR #25](https://github.com/yangsichan/tilelang-asc/pull/25) 的 Ascend 方言、Vector 分块与 JIT 编译方式，计算遵循 [TileOPs mHC 参考](https://github.com/yyttt6/TileOPs/blob/ea0d2999a830243fd398e74bb30427a064078bac/workloads/sequence_modeling/mhc.py) 的非 shifted 语义。Pre 默认使用 Cube 投影。JIT 缓存按输入形状和 Pre 标量参数特化。
 
 ## 在 Ascend 上验证
 
@@ -92,19 +92,22 @@ python bench_vllm_ascend.py --merge tilelang-pair.csv vllm-pair.csv --output vll
 合并时会校验两个 CSV 的三组 shape、Sinkhorn 次数、预热和重复次数。分环境结果只报告
 延时和加速比，CANN、PyTorch 与运行时版本可能随环境而异。同进程模式仍可记录输出差异。
 
+## Cube 投影
 
-## Cube 投影实验
+Pre 默认使用 `projection="cube"`。同一次 MixedKernel 启动里，两侧 Vector
+各读取半个 token tile，完成 BF16 转 FP32、平方和归约与 ND→NZ 排布，再把
+激活从 UB 直接交给 Cube 的 L1。Cube 执行 split-K HF32 GEMM，累加为 FP32。
+后续两次启动仍负责门控与 Sinkhorn、残差与层输入混合。Pre 共三次启动，
+中间的投影和平方和仍通过 GM workspace 交给下一阶段。
 
-`mhc_pre(..., projection="cube")` 将 `x @ phi` 改为 Ascend Cube 的 split-K
-HF32 GEMM，累加为 FP32。Vector 预处理在一次启动里提升 BF16 输入并计算
-分块平方和。随后 Cube 写出分块投影，复用后面的门控、Sinkhorn 和残差混合。
-Pre 共四次启动，计时包含 BF16 提升和 workspace 开销。默认仍为已验证的
-Vector 投影。两个路径都遵循 TileOPs 的非 shifted 接口。
+历史四次启动的版本可用 `--projection cube_split` 重跑，SIMT 投影可用
+`--projection vector`。CSV 里的 `cube_fused` 表示当前默认路径，旧版 CSV 中
+的 `cube` 在合并时识别为 `cube_split`。
 
 ```bash
 python -m pytest -q tests/test_mhc.py
-python bench_vllm_ascend.py --backend tilelang --projection cube --device npu:0 \
-  --output tilelang-cube-pair.csv
-python bench_vllm_ascend.py --merge tilelang-cube-pair.csv vllm-pair.csv \
-  --output vllm-ascend-cube-results.csv
+python bench_vllm_ascend.py --backend tilelang --device npu:0 \
+  --output tilelang-cube-fused-pair.csv
+python bench_vllm_ascend.py --merge tilelang-cube-fused-pair.csv vllm-pair.csv \
+  --output vllm-ascend-cube-fused-results.csv
 ```

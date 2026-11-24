@@ -19,7 +19,8 @@ def merge_results(tilelang_path, vllm_path, output_path):
         if len(rows) != len(CASES) or any(row["backend"] != backend for row in rows):
             raise ValueError(f"{path} must contain all {len(CASES)} cases for {backend}")
         if backend == "tilelang":
-            projections = {row.get("projection", "vector") for row in rows}
+            projections = {"cube_split" if row.get("projection") == "cube" else row.get("projection", "vector")
+                           for row in rows}
             if len(projections) != 1:
                 raise ValueError(f"{path} mixes TileLang projection modes")
             (projection,) = projections
@@ -63,7 +64,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--repeat", type=int, default=100)
-    parser.add_argument("--projection", choices=("vector", "cube"), default="vector")
+    parser.add_argument("--projection", choices=("vector", "cube_split", "cube"), default="cube")
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
     parser.add_argument("--list-cases", action="store_true")
@@ -107,6 +108,7 @@ def main():
             parser.exit(1, f"Could not load vLLM Ascend A5 HcPre/HcPost custom ops: {exc}\n")
 
     torch.npu.set_device(device)
+    projection_label = "cube_fused" if args.projection == "cube" else args.projection
     eps = 1e-6
     rng = torch.Generator().manual_seed(42)
     with args.output.open("w", encoding="utf-8", newline="") as output:
@@ -161,7 +163,7 @@ def main():
                 if not math.isfinite(latency) or latency <= 0:
                     raise RuntimeError(f"Invalid event time for B={batch}, hidden={hidden}")
                 writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
-                                 args.warmup, args.repeat, args.projection if args.backend == "tilelang" else "", f"{latency:.6f}"))
+                                 args.warmup, args.repeat, projection_label if args.backend == "tilelang" else "", f"{latency:.6f}"))
                 output.flush()
                 print(f"{args.backend} B={batch} hidden={hidden}: {latency:.3f} us", flush=True)
                 continue
@@ -176,7 +178,7 @@ def main():
                 raise RuntimeError(f"Invalid event time for B={batch}, hidden={hidden}")
             speedup = vllm_us / tilelang_us
             writer.writerow((
-                batch, hidden, args.sinkhorn_iters, args.projection, f"{tilelang_us:.3f}", f"{vllm_us:.3f}",
+                batch, hidden, args.sinkhorn_iters, projection_label, f"{tilelang_us:.3f}", f"{vllm_us:.3f}",
                 f"{speedup:.3f}", *(f"{diff:.6g}" for diff in diffs),
             ))
             output.flush()
