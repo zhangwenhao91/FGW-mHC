@@ -59,3 +59,35 @@ FGW-mHC 在 Pre 混合残差，vLLM 在 Post 混合残差。两条原生路径�
 Sinkhorn、矩阵方向、投影精度和 BF16 舍入位置有差异。CSV 记录最大绝对差，
 配对延时用于比较各自的原生实现。若 vLLM 拒绝某个 shape，脚本会报出该组
 shape，并保留已完成的行。
+
+
+### 分开测量两个环境
+
+如果现有 TileLang 环境没有 vLLM Ascend，在同一台机器、同一张空闲 NPU 上依次测量。
+先用现有环境测 TileLang：
+
+```bash
+python bench_vllm_ascend.py --backend tilelang --device npu:0 --output tilelang-pair.csv
+```
+
+再用 [官方 950DT A5 容器](https://docs.vllm.ai/projects/ascend/en/main/getting_started/installation.html)
+测 vLLM。以下假设宿主机使用 `/dev/davinci0` 和文档中的驱动路径。
+容器只需要运行算子，无需下载模型权重或启动 vLLM 服务。
+
+```bash
+IMAGE=quay.io/ascend/vllm-ascend:v0.32.0rc1-a5
+docker run --rm --shm-size=1g \
+  --device /dev/davinci0 --device /dev/davinci_manager \
+  --device /dev/devmm_svm --device /dev/hisi_hdc \
+  -v /usr/local/dcmi:/usr/local/dcmi:ro \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+  -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro \
+  -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
+  -v "$PWD:/fgw-mhc" -w /fgw-mhc "$IMAGE" \
+  python bench_vllm_ascend.py --backend vllm --device npu:0 --output vllm-pair.csv
+python bench_vllm_ascend.py --merge tilelang-pair.csv vllm-pair.csv --output vllm-ascend-results.csv
+```
+
+合并时会校验两个 CSV 的三组 shape、Sinkhorn 次数、预热和重复次数。分环境结果只报告
+延时和加速比，CANN、PyTorch 与运行时版本可能随环境而异。同进程模式仍可记录输出差异。

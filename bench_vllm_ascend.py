@@ -8,6 +8,35 @@ from pathlib import Path
 from bench_mhc import CASES, time_us
 
 
+def merge_results(tilelang_path, vllm_path, output_path):
+    tables = []
+    for path, backend in ((tilelang_path, "tilelang"), (vllm_path, "vllm")):
+        with path.open(newline="", encoding="utf-8") as source:
+            rows = list(csv.DictReader(source))
+        if len(rows) != len(CASES) or any(row["backend"] != backend for row in rows):
+            raise ValueError(f"{path} must contain all {len(CASES)} cases for {backend}")
+        table = {}
+        for row in rows:
+            latency = float(row["pair_us"])
+            if not math.isfinite(latency) or latency <= 0:
+                raise ValueError(f"Invalid median latency in {path}: {row}")
+            key = tuple(int(row[field]) for field in ("batch", "hidden", "sinkhorn_iters", "warmup", "repeat"))
+            table[key] = latency
+        if sorted(key[:2] for key in table) != sorted(CASES):
+            raise ValueError(f"{path} does not contain the requested benchmark shapes")
+        tables.append(table)
+
+    tilelang, vllm = tables
+    if tilelang.keys() != vllm.keys():
+        raise ValueError("Benchmark shapes, Sinkhorn counts, warmup and repetitions must match")
+    with output_path.open("w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat",
+                         "tilelang_pair_us", "vllm_ascendc_pair_us", "vllm_over_tilelang_speedup"))
+        for key, latency in tilelang.items():
+            writer.writerow((*key, f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
@@ -16,7 +45,13 @@ def main():
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
     parser.add_argument("--list-cases", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--backend", choices=("both", "tilelang", "vllm"), default="both")
+    mode.add_argument("--merge", type=Path, nargs=2, metavar=("TILELANG_CSV", "VLLM_CSV"))
     args = parser.parse_args()
+    if args.merge:
+        merge_results(*args.merge, args.output)
+        return
     if args.list_cases:
         for batch, hidden in CASES:
             print(f"B={batch} n=4 hidden={hidden}")
@@ -32,26 +67,30 @@ def main():
 
     device = torch.device(args.device)
     torch.npu.set_device(device)
-    try:
-        from vllm_ascend.utils import bootstrap_custom_op_env
+    if args.backend != "tilelang":
+        try:
+            from vllm_ascend.utils import bootstrap_custom_op_env
 
-        bootstrap_custom_op_env()
-        import vllm_ascend.vllm_ascend_C  # noqa: F401
+            bootstrap_custom_op_env()
+            import vllm_ascend.vllm_ascend_C  # noqa: F401
 
-        vllm_pre = torch.ops._C_ascend.npu_hc_pre_v2
-        vllm_post = torch.ops._C_ascend.npu_hc_post
-    except (ImportError, OSError, AttributeError) as exc:
-        parser.exit(1, f"Could not load vLLM Ascend A5 HcPre/HcPost custom ops: {exc}\n")
+            vllm_pre = torch.ops._C_ascend.npu_hc_pre_v2
+            vllm_post = torch.ops._C_ascend.npu_hc_post
+        except (ImportError, OSError, AttributeError) as exc:
+            parser.exit(1, f"Could not load vLLM Ascend A5 HcPre/HcPost custom ops: {exc}\n")
 
     eps = 1e-6
     rng = torch.Generator().manual_seed(42)
     with args.output.open("w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
-        writer.writerow((
-            "batch", "hidden", "sinkhorn_iters", "tilelang_pair_us", "vllm_ascendc_pair_us",
-            "vllm_over_tilelang_speedup", "layer_max_abs_diff", "h_post_max_abs_diff",
-            "native_pair_output_max_abs_diff",
-        ))
+        if args.backend != "both":
+            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "pair_us"))
+        else:
+            writer.writerow((
+                "batch", "hidden", "sinkhorn_iters", "tilelang_pair_us", "vllm_ascendc_pair_us",
+                "vllm_over_tilelang_speedup", "layer_max_abs_diff", "h_post_max_abs_diff",
+                "native_pair_output_max_abs_diff",
+            ))
         output.flush()
         for batch, hidden in CASES:
             width = 4 * hidden
@@ -74,20 +113,33 @@ def main():
                 layer_in, post, comb = vllm_pre(*vllm_args)
                 return layer_in, post, vllm_post(vllm_layer_out, vllm_x, post, comb)
 
-            actual = tilelang_pair()
-            residual_ref, layer_ref, post_ref = pre_reference(*pre_args)
-            expected = (layer_ref, post_ref, post_reference(layer_out, post_ref, residual_ref))
-            torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
-            try:
-                baseline = vllm_pair()
-                torch.npu.synchronize()
-            except RuntimeError as exc:
-                raise RuntimeError(f"vLLM AscendC failed for B={batch}, hidden={hidden}: {exc}") from exc
+            if args.backend != "vllm":
+                actual = tilelang_pair()
+                residual_ref, layer_ref, post_ref = pre_reference(*pre_args)
+                expected = (layer_ref, post_ref, post_reference(layer_out, post_ref, residual_ref))
+                torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
+            if args.backend != "tilelang":
+                try:
+                    baseline = vllm_pair()
+                    torch.npu.synchronize()
+                except RuntimeError as exc:
+                    raise RuntimeError(f"vLLM AscendC failed for B={batch}, hidden={hidden}: {exc}") from exc
+                if any(not torch.isfinite(tensor).all().item() for tensor in baseline):
+                    raise RuntimeError(f"Non-finite vLLM AscendC output for B={batch}, hidden={hidden}")
+
+            if args.backend != "both":
+                pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
+                latency = time_us(pair, torch, args.warmup, args.repeat)
+                if not math.isfinite(latency) or latency <= 0:
+                    raise RuntimeError(f"Invalid event time for B={batch}, hidden={hidden}")
+                writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
+                                 args.warmup, args.repeat, f"{latency:.6f}"))
+                output.flush()
+                print(f"{args.backend} B={batch} hidden={hidden}: {latency:.3f} us", flush=True)
+                continue
 
             diffs = []
             for fg, vv in zip(actual, baseline, strict=True):
-                if not torch.isfinite(vv).all().item():
-                    raise RuntimeError(f"Non-finite vLLM AscendC output for B={batch}, hidden={hidden}")
                 diffs.append((fg.float() - vv.reshape_as(fg).float()).abs().max().item())
 
             tilelang_us = time_us(tilelang_pair, torch, args.warmup, args.repeat)
