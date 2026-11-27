@@ -13,6 +13,9 @@ from bench_mhc import CASES, time_us
 def compare(fgw, upstream, reference, torch, args):
     for op in (fgw, upstream):
         torch.testing.assert_close(op(), reference, atol=0.01, rtol=0.01)
+    selected = tuple(type(kernel).__module__ for kernel in upstream.func.iter_kernels())
+    if not any(module.startswith("tileops._kernels.ascend.") for module in selected):
+        raise RuntimeError(f"TileOPs did not select an Ascend kernel: {selected}")
     torch.npu.synchronize()
 
     samples = {"fgw": [], "upstream": []}
@@ -81,7 +84,7 @@ def main():
             for repeat in args.sinkhorn_iters:
                 eps = 0.02
                 params = (1.0, 1.0, 1.0, repeat, eps)
-                pre = MHCPreFwdOp(*params, target="ascend")
+                pre = MHCPreFwdOp(*params)
                 record("pre", batch, hidden, repeat, eps, args.projection,
                        partial(mhc_pre, *pre_inputs, *params, projection=args.projection),
                        partial(pre, *pre_inputs), pre_reference(*pre_inputs, *params))
@@ -90,7 +93,7 @@ def main():
             weights = torch.randn(batch, 4, generator=rng).to(device)
             residual = torch.randn(batch, width, generator=rng).to(device, torch.bfloat16)
             post_inputs = (layer, weights, residual)
-            post = MHCPostFwdOp(target="ascend")
+            post = MHCPostFwdOp()
             record("post", batch, hidden, "", "", "default",
                    partial(mhc_post, *post_inputs), partial(post, *post_inputs),
                    post_reference(*post_inputs))
