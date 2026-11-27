@@ -53,27 +53,22 @@ def mhc_pre(
     _check_tensor("phi", phi, (width, 24), torch.float32, device)
     _check_tensor("b", b, (24,), torch.float32, device)
 
-    if projection not in ("cube", "cube_split", "vector"):
-        raise ValueError("projection must be 'cube', 'cube_split', or 'vector'")
+    if projection not in ("cube", "cube_mk", "cube_split", "vector"):
+        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_split', or 'vector'")
     cube = projection != "vector"
-    fused = projection == "cube"
+    merge = projection == "cube_mk"
+    fused = projection in ("cube", "cube_mk")
     chunk = gcd(width, 256)
     splits = width // chunk
     tile = gcd(hidden, 256)
     padded_batch = (batch + 15) // 16 * 16
     launch = dict(batch=batch, width=width, chunk=chunk)
-    mixing = _compile(
-        "mix",
-        batch=batch,
-        width=width,
-        splits=splits,
+    coefficient_config = dict(
         repeat=sinkhorn_repeat,
         eps=float(sinkhorn_eps),
         alpha_pre=float(alpha_pre),
         alpha_post=float(alpha_post),
         alpha_res=float(alpha_res),
-        cube=cube,
-        fused=fused,
     )
     apply = _compile("apply_mix", batch=batch, hidden=hidden, tile=tile)
     partial_shape = (splits, padded_batch, 32) if cube else (batch, splits, 32)
@@ -86,9 +81,13 @@ def mhc_pre(
     if fused:
         jobs = padded_batch // 16 * splits
         cores = next(candidate for candidate in range(min(jobs, 28), 0, -1) if jobs % candidate == 0)
-        project = _compile("project_cube_fused", **launch, cores=cores)
+        project = _compile(
+            "project_cube_fused", **launch, cores=cores, merge=merge,
+            **(coefficient_config if merge else {}),
+        )
         squares = torch.empty((splits, padded_batch, 8), device=device, dtype=torch.float32)
-        project(x, phi, partial, squares)
+        # Read aliases express the workspace publication boundary to the scheduler.
+        project(x, phi, partial, squares, partial, squares, b, weights, h_post)
     elif cube:
         prepare = _compile("prepare_cube", **launch)
         project = _compile("project_cube", **launch)
@@ -100,7 +99,12 @@ def mhc_pre(
         _compile("project", **launch)(x, phi, partial)
         # The Vector specialization reads its RMS statistics from partial.
         squares = partial
-    mixing(partial, squares, b, weights, h_post)
+    if not merge:
+        mixing = _compile(
+            "mix", batch=batch, width=width, splits=splits, cube=cube, fused=fused,
+            **coefficient_config,
+        )
+        mixing(partial, squares, b, weights, h_post)
     apply(x.view(batch, 4, hidden), weights, x_res.view(batch, 4, hidden), x_layer)
     return x_res, x_layer, h_post
 

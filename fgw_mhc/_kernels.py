@@ -96,8 +96,71 @@ def project_cube(x, phi, partial, *, batch: int, width: int, chunk: int):
             T.copy(acc, partial[part, m:m + rows, 0:cols])
 
 
+@T.macro
+def _compute_weights(
+    partial_ub, squares_ub, bias_ub, totals, weights_ub, post_ub,
+    width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused,
+):
+    with T.SimtVF(threads=32):
+        for q in T.Parallel(32):
+            value = T.alloc_var(T.float32, init=0.0)
+            if cube and q == 24:
+                for split in T.serial(splits):
+                    if fused:
+                        value += squares_ub[split, 0]
+                    else:
+                        for lane in T.unroll(8):
+                            value += squares_ub[split, lane]
+            else:
+                for split in T.serial(splits):
+                    value += partial_ub[split, q]
+            totals[q] = value
+    with T.SimtVF(threads=32):
+        for lane in T.Parallel(1):
+            # Sinkhorn is serial within this lane. Publish only final weights to UB.
+            residual = T.alloc_local((16,), T.float32)
+            norm = T.sqrt(totals[24] / width) + 0.0001
+            for i in T.serial(4):
+                pre = alpha_pre * totals[i] / norm + bias_ub[i]
+                post = alpha_post * totals[4 + i] / norm + bias_ub[4 + i]
+                weights_ub[i] = 1.0 / (1.0 + T.exp(-pre))
+                post_ub[i] = 2.0 / (1.0 + T.exp(-post))
+            for i in T.serial(4):
+                row = i * 4
+                for j in T.serial(4):
+                    q = 8 + i * 4 + j
+                    residual[row + j] = alpha_res * totals[q] / norm + bias_ub[q]
+                row_max = T.alloc_var(T.float32, init=residual[row])
+                for j in T.serial(1, 4):
+                    row_max = T.max(row_max, residual[row + j])
+                for j in T.serial(4):
+                    residual[row + j] = T.exp(residual[row + j] - row_max)
+            for iteration in T.serial(repeat):
+                for i in T.serial(4):
+                    row_sum = T.alloc_var(T.float32, init=0.0)
+                    for j in T.serial(4):
+                        row_sum += residual[i * 4 + j]
+                    for j in T.serial(4):
+                        residual[i * 4 + j] /= row_sum + eps
+                for j in T.serial(4):
+                    col_sum = T.alloc_var(T.float32, init=0.0)
+                    for i in T.serial(4):
+                        col_sum += residual[i * 4 + j]
+                    for i in T.serial(4):
+                        residual[i * 4 + j] /= col_sum + eps
+            for i in T.serial(16):
+                weights_ub[4 + i] = residual[i]
+            for i in T.serial(20, 24):
+                weights_ub[i] = 0.0
+
+
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
-def project_cube_fused(x, phi, partial, squares, *, batch: int, width: int, chunk: int, cores: int):
+def project_cube_fused(
+    x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, *,
+    batch: int, width: int, chunk: int, cores: int, merge: bool,
+    repeat: int = 0, eps: float = 0.02,
+    alpha_pre: float = 1.0, alpha_post: float = 1.0, alpha_res: float = 1.0,
+):
     """Prepare X on paired Vector cores and feed Cube without a GM conversion buffer."""
     splits = width // chunk
     rows = 16
@@ -110,6 +173,12 @@ def project_cube_fused(x, phi, partial, squares, *, batch: int, width: int, chun
     partial: T.Tensor[(splits, row_tiles * rows, cols), T.float32]
     squares: T.Tensor[(splits, row_tiles * rows, 8), T.float32]
 
+    partial_read: T.Tensor[(splits, row_tiles * rows, cols), T.float32]
+    squares_read: T.Tensor[(splits, row_tiles * rows, 8), T.float32]
+    bias: T.Tensor[(24,), T.float32]
+    weights: T.Tensor[(batch, 24), T.float32]
+    h_post: T.Tensor[(batch, 4), T.float32]
+
     with T.MixedKernel(cores) as (core, side):
         x_ub = T.alloc_shared((half, chunk), T.bfloat16)
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
@@ -120,6 +189,16 @@ def project_cube_fused(x, phi, partial, squares, *, batch: int, width: int, chun
         a_l0 = T.alloc_l0a((rows, chunk), T.float32)
         b_l0 = T.alloc_l0b((cols, chunk), T.float32)
         acc = T.alloc_l0c((rows, cols), T.float32)
+
+        if merge:
+            T.import_source("#define FGW_SYNC(...) ({ __VA_ARGS__; 0; })\n")
+            raw_ub = T.alloc_shared((half, cols), T.float32)
+            partial_ub = T.alloc_shared((splits, cols), T.float32)
+            split_squares_ub = T.alloc_shared((splits, 8), T.float32)
+            bias_ub = T.alloc_shared((24,), T.float32)
+            totals = T.alloc_shared((32,), T.float32)
+            weights_ub = T.alloc_shared((24,), T.float32)
+            post_ub = T.alloc_shared((8,), T.float32)
 
         T.set_hf32_mode("nearest_even")
         for step in T.Pipelined(jobs // cores):
@@ -154,7 +233,35 @@ def project_cube_fused(x, phi, partial, squares, *, batch: int, width: int, chun
             T.copy(a_l1, a_l0)
             T.copy(b_l1, b_l0, transpose=True)
             T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=True)
-            T.copy(acc, partial[part, m:m + rows, 0:cols])
+            if merge:
+                # Move the Cube result to Vector so both workspaces are published by MTE3.
+                T.dual_copy(acc, raw_ub)
+                T.copy(raw_ub, partial[part, vector_m:vector_m + half, 0:cols])
+            else:
+                T.copy(acc, partial[part, m:m + rows, 0:cols])
+
+        if merge:
+            # Every Vector half participates, including halves with no coefficient work.
+            with T.PerCoreTask():
+                T.ascend_sync_inter_arrive("PIPE_MTE3", 1)
+                T.ascend_sync_inter_wait("PIPE_MTE3", 1)
+                _drain = T.call_extern("int32", "FGW_SYNC", T.ascend_pipe_barrier("PIPE_MTE3"))
+                _ready = T.call_extern("int32", "FGW_SYNC", T.ascend_set_flag("MTE3_MTE2", 7))
+            with T.Stage(0):
+                with T.Task():
+                    T.ascend_wait_flag("MTE3_MTE2", 7)
+                    T.copy(bias, bias_ub)
+                first = core * 2 + side
+                for step in T.serial(T.ceildiv(T.max(batch - first, 0), cores * 2)):
+                    token = first + step * cores * 2
+                    T.copy(partial_read[0:splits, token, 0:cols], partial_ub)
+                    T.copy(squares_read[0:splits, token, 0:8], split_squares_ub)
+                    _compute_weights(
+                        partial_ub, split_squares_ub, bias_ub, totals, weights_ub, post_ub,
+                        width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True,
+                    )
+                    T.copy(weights_ub, weights[token, 0])
+                    T.copy(post_ub[0:4], h_post[token, 0])
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
@@ -179,8 +286,7 @@ def mix(
     cores = min(batch, 56)
     with T.Kernel(cores) as core:
         partial_ub = T.alloc_shared((splits, 32), T.float32)
-        if cube:
-            squares_ub = T.alloc_shared((splits, 8), T.float32)
+        squares_ub = T.alloc_shared((splits, 8), T.float32) if cube else partial_ub
         bias_ub = T.alloc_shared((24,), T.float32)
         totals = T.alloc_shared((32,), T.float32)
         weights_ub = T.alloc_shared((24,), T.float32)
@@ -195,57 +301,10 @@ def mix(
             else:
                 T.copy(partial[token, 0, 0], partial_ub)
             T.copy(bias, bias_ub)
-            with T.SimtVF(threads=32):
-                for q in T.Parallel(32):
-                    value = T.alloc_var(T.float32, init=0.0)
-                    if cube and q == 24:
-                        for split in T.serial(splits):
-                            if fused:
-                                value += squares_ub[split, 0]
-                            else:
-                                for lane in T.unroll(8):
-                                    value += squares_ub[split, lane]
-                    else:
-                        for split in T.serial(splits):
-                            value += partial_ub[split, q]
-                    totals[q] = value
-            with T.SimtVF(threads=32):
-                for lane in T.Parallel(1):
-                    # Sinkhorn is serial within this lane. Publish only final weights to UB.
-                    residual = T.alloc_local((16,), T.float32)
-                    norm = T.sqrt(totals[24] / width) + 0.0001
-                    for i in T.serial(4):
-                        pre = alpha_pre * totals[i] / norm + bias_ub[i]
-                        post = alpha_post * totals[4 + i] / norm + bias_ub[4 + i]
-                        weights_ub[i] = 1.0 / (1.0 + T.exp(-pre))
-                        post_ub[i] = 2.0 / (1.0 + T.exp(-post))
-                    for i in T.serial(4):
-                        row = i * 4
-                        for j in T.serial(4):
-                            q = 8 + i * 4 + j
-                            residual[row + j] = alpha_res * totals[q] / norm + bias_ub[q]
-                        row_max = T.alloc_var(T.float32, init=residual[row])
-                        for j in T.serial(1, 4):
-                            row_max = T.max(row_max, residual[row + j])
-                        for j in T.serial(4):
-                            residual[row + j] = T.exp(residual[row + j] - row_max)
-                    for iteration in T.serial(repeat):
-                        for i in T.serial(4):
-                            row_sum = T.alloc_var(T.float32, init=0.0)
-                            for j in T.serial(4):
-                                row_sum += residual[i * 4 + j]
-                            for j in T.serial(4):
-                                residual[i * 4 + j] /= row_sum + eps
-                        for j in T.serial(4):
-                            col_sum = T.alloc_var(T.float32, init=0.0)
-                            for i in T.serial(4):
-                                col_sum += residual[i * 4 + j]
-                            for i in T.serial(4):
-                                residual[i * 4 + j] /= col_sum + eps
-                    for i in T.serial(16):
-                        weights_ub[4 + i] = residual[i]
-                    for i in T.serial(20, 24):
-                        weights_ub[i] = 0.0
+            _compute_weights(
+                partial_ub, squares_ub, bias_ub, totals, weights_ub, post_ub,
+                width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused,
+            )
             T.copy(weights_ub, weights[token, 0])
             T.copy(post_ub[0:4], h_post[token, 0])
 
