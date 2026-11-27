@@ -57,13 +57,20 @@ def mhc_pre(
     _check_tensor("phi", phi, (width, 24), torch.float32, device)
     _check_tensor("b", b, (24,), torch.float32, device)
 
-    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_split", "vector"):
-        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_full_tail', 'cube_split', or 'vector'")
+    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_split", "vector"):
+        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_full_tail', 'cube_full_k', 'cube_split', or 'vector'")
     cube = projection != "vector"
-    full_pre = projection in ("cube_full", "cube_full_simd", "cube_full_tail")
+    full_pre = projection in ("cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k")
     merge = full_pre or projection == "cube_mk"
     fused = merge or projection == "cube"
     chunk = gcd(width, 256)
+    if projection == "cube_full_k":
+        row_tiles = (batch + 15) // 16
+        # Select the smallest aligned K block that gives one job per active Cube core.
+        for candidate in (256, 320, 384, 448, 512):
+            if width % candidate == 0 and row_tiles * (width // candidate) <= 28:
+                chunk = candidate
+                break
     splits = width // chunk
     tile = hidden if full_pre and hidden <= 4096 else gcd(hidden, 256)
     padded_batch = (batch + 15) // 16 * 16

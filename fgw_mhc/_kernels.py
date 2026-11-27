@@ -226,6 +226,8 @@ def project_cube_fused(
     rows = 16
     half = rows // 2
     cols = 32
+    # Split larger L1 windows to keep each L0 operand within the existing footprint.
+    mad_k = chunk // 2 if chunk > 256 else chunk
     row_tiles = (batch + rows - 1) // rows
     jobs = row_tiles * splits
     x: T.Tensor[(batch, width), T.bfloat16]
@@ -250,8 +252,8 @@ def project_cube_fused(
         squares_ub = T.alloc_shared((half, 8), T.float32)
         a_l1 = T.alloc_l1((rows, chunk), T.float32)
         b_l1 = T.alloc_l1((chunk, cols), T.float32)
-        a_l0 = T.alloc_l0a((rows, chunk), T.float32)
-        b_l0 = T.alloc_l0b((cols, chunk), T.float32)
+        a_l0 = T.alloc_l0a((rows, mad_k), T.float32)
+        b_l0 = T.alloc_l0b((cols, mad_k), T.float32)
         acc = T.alloc_l0c((rows, cols), T.float32)
 
         if merge:
@@ -312,9 +314,16 @@ def project_cube_fused(
             T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
             if not merge or step < jobs // cores - 1:
                 T.copy(squares_ub, squares[part, vector_m:vector_m + half, 0:8])
-            T.copy(a_l1, a_l0)
-            T.copy(b_l1, b_l0, transpose=True)
-            T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=True)
+            if chunk == mad_k:
+                T.copy(a_l1, a_l0)
+                T.copy(b_l1, b_l0, transpose=True)
+                T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=True)
+            else:
+                for mad in T.serial(chunk // mad_k):
+                    offset = mad * mad_k
+                    T.copy(a_l1[:, offset:offset + mad_k], a_l0)
+                    T.copy(b_l1[offset:offset + mad_k, :], b_l0, transpose=True)
+                    T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=mad == 0)
             if merge:
                 # Move the Cube result to Vector so both workspaces are published by MTE3.
                 T.dual_copy(acc, raw_ub)

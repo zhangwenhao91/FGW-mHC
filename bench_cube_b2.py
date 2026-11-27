@@ -12,6 +12,7 @@ ROUTES = ("cube", "cube_mk", "cube_full")
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--split-k", action="store_true", help="Compare cube_full with one split-K job per core")
     mode.add_argument("--tail", action="store_true", help="Compare cube_full with valid-row preparation")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
     parser.add_argument("--batch", type=int, choices=tuple(batch for batch, _ in CASES), default=2)
@@ -57,6 +58,8 @@ def main():
     routes = ROUTES
     if args.simd:
         routes = ("cube_full", "cube_full_simd")
+    elif args.split_k:
+        routes = ("cube_full", "cube_full_k")
     elif args.tail:
         routes = ("cube_full", "cube_full_tail")
     for route in routes:
