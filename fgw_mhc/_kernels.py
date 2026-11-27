@@ -151,6 +151,7 @@ def _normalize_simd(logits_ub, weights_ub, post_ub, repeat, eps):
 def _compute_weights(
     partial_ub, squares_ub, bias_ub, totals, weights_ub, post_ub, logits_ub,
     width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused, simd_weights,
+    projection_row=None,
 ):
     with T.SimtVF(threads=32):
         for q in T.Parallel(32):
@@ -163,8 +164,11 @@ def _compute_weights(
                         for lane in T.unroll(8):
                             value += squares_ub[split, lane]
             else:
-                for split in T.serial(splits):
-                    value += partial_ub[split, q]
+                if projection_row is not None:
+                    value += partial_ub[projection_row, q]
+                else:
+                    for split in T.serial(splits):
+                        value += partial_ub[split, q]
             totals[q] = value
     if simd_weights:
         with T.SimtVF(threads=32):
@@ -408,7 +412,6 @@ def project_cube_m_only(
         acc = T.alloc_l0c((rows, cols), T.float32)
 
         raw_ub = T.alloc_shared((half, cols), T.float32)
-        partial_ub = T.alloc_shared((1, cols), T.float32)
         sum_ub = T.alloc_shared((1, 8), T.float32)
         bias_ub = T.alloc_shared((24,), T.float32)
         totals = T.alloc_shared((32,), T.float32)
@@ -465,7 +468,6 @@ def project_cube_m_only(
             T.copy(bias, bias_ub)
             for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
                 token = vector_m + row
-                T.copy(raw_ub[row:row + 1, :], partial_ub)
                 with T.SimtVF(threads=32):
                     for lane in T.Parallel(8):
                         value = T.alloc_var(T.float32, init=0.0)
@@ -474,11 +476,11 @@ def project_cube_m_only(
                                 value += squares_ub[part, row, 0]
                         sum_ub[0, lane] = value
                 if debug:
-                    T.copy(partial_ub[0, 0:24], trace[token, 0:24])
+                    T.copy(raw_ub[row, 0:24], trace[token, 0:24])
                     T.copy(sum_ub[0, 0:8], trace[token, 24:32])
                 _compute_weights(
-                    partial_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,
-                    width, 1, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, False,
+                    raw_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,
+                    width, 1, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, False, row,
                 )
                 for column_tile in T.serial(hidden // tile):
                     offset = column_tile * tile
