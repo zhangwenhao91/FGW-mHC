@@ -36,20 +36,20 @@ def merge_results(tilelang_path, vllm_path, output_path):
             if not math.isfinite(latency) or latency <= 0:
                 raise ValueError(f"Invalid median latency in {path}: {row}")
             key = tuple(int(row[field]) for field in ("batch", "hidden", "sinkhorn_iters", "warmup", "repeat"))
-            table[(*key, stage)] = latency
+            table[(*key, float(row.get("sinkhorn_eps", 1e-6)), stage)] = latency
         if sorted((key[:2], key[-1]) for key in table) != sorted((shape, stage) for shape in CASES for stage in stages):
             raise ValueError(f"{path} does not contain the requested benchmark shapes")
         tables.append(table)
 
     tilelang, vllm = tables
     if tilelang.keys() != vllm.keys():
-        raise ValueError("Benchmark stages, shapes, Sinkhorn counts, warmup and repetitions must match")
+        raise ValueError("Benchmark stages, shapes, Sinkhorn parameters, warmup and repetitions must match")
     with output_path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
         split = any(key[-1] != "pair" for key in tilelang)
         stage_columns = ("stage",) if split else ()
         metric = "stage" if split else "pair"
-        writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat", *stage_columns,
+        writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "sinkhorn_eps", *stage_columns,
                          "tilelang_projection", f"tilelang_{metric}_us", f"vllm_ascendc_{metric}_us",
                          "vllm_over_tilelang_speedup"))
         for key, latency in tilelang.items():
@@ -112,7 +112,12 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--backend", choices=("both", "tilelang", "vllm"), default="both")
     mode.add_argument("--merge", type=Path, nargs=2, metavar=("TILELANG_CSV", "VLLM_CSV"))
+    parser.add_argument("--tileops-spec", action="store_true", help="Use TileOPs mHC manifest Sinkhorn settings")
     args = parser.parse_args()
+    if args.tileops_spec:
+        if args.merge or args.backend == "both" or args.profile_dir or args.sweep_pairs:
+            parser.error("--tileops-spec requires a single backend and standard pair or stage timing")
+        args.sinkhorn_iters = 1
     if args.profile_dir and (args.merge or args.split_stages or args.backend == "both"):
         parser.error("--profile-dir requires one backend and continuous pair execution")
     if args.sweep_pairs is not None and (
@@ -162,7 +167,7 @@ def main():
 
     torch.npu.set_device(device)
     projection_label = "cube_fused" if args.projection == "cube" else args.projection
-    eps = 1e-6
+    eps = 0.02 if args.tileops_spec else 1e-6
     rng = torch.Generator().manual_seed(42)
     output_context = nullcontext(sys.stdout) if args.profile_dir else args.output.open("w", encoding="utf-8", newline="")
     with output_context as output:
@@ -173,9 +178,9 @@ def main():
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "projection",
                              "pairs_per_event", "order", "pair_us"))
         elif args.split_stages:
-            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "stage", "stage_us"))
+            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "stage", "stage_us", "sinkhorn_eps"))
         elif args.backend != "both":
-            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "pair_us"))
+            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "pair_us", "sinkhorn_eps"))
         else:
             writer.writerow((
                 "batch", "hidden", "sinkhorn_iters", "tilelang_projection", "tilelang_pair_us", "vllm_ascendc_pair_us",
@@ -194,7 +199,7 @@ def main():
             vllm_layer_out = layer_out.view(1, batch, hidden)
             scale = torch.ones(3, dtype=torch.float32, device=device)
             pre_args = (phi, x, bias, 1.0, 1.0, 1.0, args.sinkhorn_iters, eps)
-            vllm_args = (vllm_x, vllm_phi, scale, bias, 4, args.sinkhorn_iters, eps, eps)
+            vllm_args = (vllm_x, vllm_phi, scale, bias, 4, args.sinkhorn_iters, 1e-6, eps)
 
             def tilelang_pair(trace=False):
                 if not trace:
@@ -255,7 +260,7 @@ def main():
                         raise RuntimeError(f"Invalid {stage} event time for B={batch}, hidden={hidden}")
                     projection = projection_label if args.backend == "tilelang" else ""
                     writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
-                                     args.warmup, args.repeat, projection, stage, f"{latency:.6f}"))
+                                     args.warmup, args.repeat, projection, stage, f"{latency:.6f}", eps))
                     output.flush()
                     print(f"{args.backend} {stage} B={batch} hidden={hidden}: {latency:.3f} us", flush=True)
                 continue
@@ -325,7 +330,7 @@ def main():
                 if not math.isfinite(latency) or latency <= 0:
                     raise RuntimeError(f"Invalid event time for B={batch}, hidden={hidden}")
                 writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
-                                 args.warmup, args.repeat, projection_label if args.backend == "tilelang" else "", f"{latency:.6f}"))
+                                 args.warmup, args.repeat, projection_label if args.backend == "tilelang" else "", f"{latency:.6f}", eps))
                 output.flush()
                 print(f"{args.backend} B={batch} hidden={hidden}: {latency:.3f} us", flush=True)
                 continue
