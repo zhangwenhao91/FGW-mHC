@@ -442,8 +442,9 @@ def apply_mix(x, weights, x_res, x_layer, *, batch: int, hidden: int, tile: int)
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
-def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int, cores: int, stages: int):
+def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int, cores: int, stages: int, streams: int):
     tiles = hidden // tile
+    groups = 4 // streams
     x_layer: T.Tensor[(batch, hidden), T.bfloat16]
     h_post: T.Tensor[(batch, 4), T.float32]
     x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
@@ -452,28 +453,30 @@ def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int, cor
     with T.Kernel(cores) as core:
         layer_ub = T.alloc_shared((tile,), T.bfloat16)
         post_ub = T.alloc_shared((8,), T.float32)
-        res_ub = T.alloc_shared((4, tile), T.bfloat16)
-        out_ub = T.alloc_shared((4, tile), T.bfloat16)
+        res_ub = T.alloc_shared((streams, tile), T.bfloat16)
+        out_ub = T.alloc_shared((streams, tile), T.bfloat16)
         if stages > 0:
             T.annotate_buffer_versions({
                 layer_ub: stages, post_ub: stages, res_ub: stages, out_ub: stages,
             })
-        for token, column_tile in T.Persistent(
-            [batch, tiles], cores, core, group_size=1, num_stages=stages,
+        for token_group, column_tile in T.Persistent(
+            [batch * groups, tiles], cores, core, group_size=1, num_stages=stages,
         ):
+            token = token_group // groups
+            stream = token_group % groups * streams
             start = column_tile * tile
             T.copy(x_layer[token, start], layer_ub)
-            T.copy(h_post[token, 0], post_ub[0:4])
-            T.copy(x_res[token, 0, start], res_ub)
+            T.copy(h_post[token, stream:stream + streams], post_ub[0:streams])
+            T.copy(x_res[token, stream:stream + streams, start:start + tile], res_ub)
             with T.SimdVF():
-                coeff = S.alloc_local((4,), T.float32)
-                for row in T.unroll(4, explicit=True):
+                coeff = S.alloc_local((streams,), T.float32)
+                for row in T.unroll(streams, explicit=True):
                     coeff[row] = S.vld(post_ub[row], dist="BRC_B32")
                 for chunk in T.serial(tile // 64):
                     col = chunk * 64
                     layer = S.vcvt(S.vld(layer_ub[col], dist="UNPK_B16"), T.float32, part=0)
-                    for row in T.unroll(4, explicit=True):
+                    for row in T.unroll(streams, explicit=True):
                         residual = S.vcvt(S.vld(res_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
                         result = S.vadd(residual, S.vmul(layer, coeff[row]))
                         S.vsts(out_ub[row, col], S.vcvt(result, T.bfloat16), dist="PK_B32")
-            T.copy(out_ub, out[token, 0, start], l2_cache_ctrl=0)
+            T.copy(out_ub, out[token, stream:stream + streams, start:start + tile], l2_cache_ctrl=0)

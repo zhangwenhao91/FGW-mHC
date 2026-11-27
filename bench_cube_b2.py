@@ -12,6 +12,7 @@ ROUTES = ("cube", "cube_mk", "cube_full")
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--post-streams", action="store_true", help="Time Post only with 1, 2, or 4 streams per task")
     mode.add_argument("--post-pipeline", action="store_true", help="Compare default, capped, and triple-buffered Post")
     mode.add_argument("--split-k", action="store_true", help="Compare cube_full with one split-K job per core")
     mode.add_argument("--tail", action="store_true", help="Compare cube_full with valid-row preparation")
@@ -51,7 +52,13 @@ def main():
     layer = layer.to(device, torch.bfloat16)
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, 20, 1e-6)
 
+    if args.post_streams:
+        weights = torch.randn(batch, 4, generator=rng).to(device)
+        post_inputs = (layer, weights, x)
+
     def run(route):
+        if args.post_streams:
+            return mhc_post(*post_inputs, streams_per_task=int(route))
         projection = "cube_full" if args.post_pipeline else route
         residual, layer_in, post = mhc_pre(*inputs, projection=projection)
         options = {}
@@ -59,10 +66,15 @@ def main():
             options = {"num_vec_cores": args.post_cores, "pipeline": route == "post_triple"}
         return residual, layer_in, post, mhc_post(layer, post, residual, **options)
 
-    residual, layer_in, post = pre_reference(*inputs)
-    expected = (residual, layer_in, post, post_reference(layer, post, residual))
+    if args.post_streams:
+        expected = post_reference(*post_inputs)
+    else:
+        residual, layer_in, post = pre_reference(*inputs)
+        expected = (residual, layer_in, post, post_reference(layer, post, residual))
     routes = ROUTES
-    if args.post_pipeline:
+    if args.post_streams:
+        routes = ("1", "2", "4")
+    elif args.post_pipeline:
         routes = ("post_default", "post_capped", "post_triple")
     elif args.simd:
         routes = ("cube_full", "cube_full_simd")
@@ -78,7 +90,8 @@ def main():
     positions = {route: [[] for _ in routes] for route in routes}
     with open(args.output, "w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
-        writer.writerow(("batch", "hidden", "cycle", "order", "position", "projection", "pair_us"))
+        variant, metric = ("streams_per_task", "post_us") if args.post_streams else ("projection", "pair_us")
+        writer.writerow(("batch", "hidden", "cycle", "order", "position", variant, metric))
         for cycle in range(1, args.cycles + 1):
             for order in permutations(routes):
                 order_label = "/".join(order)

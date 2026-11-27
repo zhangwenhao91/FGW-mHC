@@ -45,7 +45,8 @@ def test_pre_post(device, batch, hidden, repeat, projection):
     )
 
 @pytest.mark.parametrize("batch,hidden", [(1, 1280), (2, 1920), (4, 2560)])
-def test_post_pipeline(device, batch, hidden):
+@pytest.mark.parametrize("streams_per_task", [1, 2, 4])
+def test_post_streams_and_pipeline(device, batch, hidden, streams_per_task):
     rng = torch.Generator().manual_seed(42)
     layer = torch.randn(batch, hidden, generator=rng).bfloat16()
     weights = torch.randn(batch, 4, generator=rng)
@@ -53,6 +54,7 @@ def test_post_pipeline(device, batch, hidden):
     expected = post_reference(layer, weights, residual)
     actual = mhc_post(
         layer.to(device), weights.to(device), residual.to(device),
-        pipeline=True, num_vec_cores=2 if batch == 1 else 8,
+        pipeline=streams_per_task == 4, num_vec_cores=2 if batch == 1 else 8,
+        streams_per_task=streams_per_task,
     )
     torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.01)

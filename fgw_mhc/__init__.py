@@ -130,7 +130,7 @@ def mhc_pre(
     return x_res, x_layer, h_post
 
 
-def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56):
+def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, streams_per_task=4):
     """Return the flattened BF16 residual plus the scaled layer output."""
     batch, hidden = _check_input(x_layer_out)
     device = x_layer_out.device
@@ -140,11 +140,13 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56):
 
     if type(num_vec_cores) is not int or not 1 <= num_vec_cores <= 56:
         raise ValueError("num_vec_cores must be an integer from 1 to 56")
+    if type(streams_per_task) is not int or streams_per_task not in (1, 2, 4):
+        raise ValueError("streams_per_task must be 1, 2, or 4")
     tile = gcd(hidden, 256)
-    jobs = batch * (hidden // tile)
+    jobs = batch * (4 // streams_per_task) * (hidden // tile)
     cores = min(jobs, num_vec_cores)
     stages = 3 if pipeline and jobs > cores else 0
-    kernel = _compile("post", batch=batch, hidden=hidden, tile=tile, cores=cores, stages=stages)
+    kernel = _compile("post", batch=batch, hidden=hidden, tile=tile, cores=cores, stages=stages, streams=streams_per_task)
     out = torch.empty_like(x_res)
     kernel(x_layer_out, h_post, x_res.view(batch, 4, hidden), out.view(batch, 4, hidden))
     return out
