@@ -8,7 +8,8 @@ case "${2:-all}" in
     all) modes=(stages pair); projection=cube_full; label=tileops-spec ;;
     tuned-pair) modes=(pair); projection=tileops_tuned; label=tileops-spec-tuned ;;
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4]" >&2; exit 2 ;;
+    sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -25,6 +26,9 @@ for mode in "${modes[@]}"; do
     fi
     prefix="$label-$mode-card$card"
     common=(--tileops-spec --device npu:0 "${stage_args[@]}")
+    if [[ "$mode" == sweep ]]; then
+        common+=(--batch 4 --sweep-pairs 1 8 32)
+    fi
     tilelang_output=(--output "$prefix-tilelang.csv")
     vllm_output=(--output "$prefix-vllm.csv")
     if [[ "$mode" == profile ]]; then
@@ -46,6 +50,10 @@ for mode in "${modes[@]}"; do
         --backend vllm "${common[@]}" "${vllm_output[@]}"
     if [[ "$mode" == profile ]]; then
         cat "$profile_dir"/{tilelang,vllm}/b4-h2560/unprofiled-pair.csv
+        continue
+    fi
+    if [[ "$mode" == sweep ]]; then
+        cat "$prefix-tilelang.csv" "$prefix-vllm.csv"
         continue
     fi
     python bench_vllm_ascend.py --merge "$prefix-tilelang.csv" "$prefix-vllm.csv" \

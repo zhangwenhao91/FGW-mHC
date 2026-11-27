@@ -156,8 +156,8 @@ def main():
     parser.add_argument("--tileops-spec", action="store_true", help="Use TileOPs mHC manifest Sinkhorn settings")
     args = parser.parse_args()
     if args.tileops_spec:
-        if args.merge or args.backend == "both" or args.sweep_pairs:
-            parser.error("--tileops-spec requires a single backend and does not support event sweeps")
+        if args.merge or args.backend == "both":
+            parser.error("--tileops-spec requires a single backend")
         args.sinkhorn_iters = 1
     if args.profile_dir and (args.merge or args.split_stages or args.backend == "both"):
         parser.error("--profile-dir requires one backend and continuous pair execution")
