@@ -5,6 +5,8 @@ import tilelang.ascend.language as T
 from tilelang.ascend.language import simd as S
 from tilelang.layout import make_ascend_compact_nz_layout
 
+_SIMD_WEIGHT_STRIDE = 64
+
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def project(x, phi, partial, *, batch: int, width: int, chunk: int):
@@ -142,7 +144,7 @@ def _normalize_simd(logits_ub, weights_ub, post_ub, repeat, eps):
             for row in T.unroll(4, explicit=True):
                 rows[row] = S.vdiv(rows[row], denom, four)
         for row in T.unroll(4, explicit=True):
-            S.vsts(weights_ub[(row + 1) * weight_stride], rows[row], four)
+            S.vsts(weights_ub[(row + 1) * _SIMD_WEIGHT_STRIDE], rows[row], four)
 
 
 @T.macro
@@ -259,7 +261,7 @@ def project_cube_fused(
             split_squares_ub = T.alloc_shared((splits, 8), T.float32)
             bias_ub = T.alloc_shared((24,), T.float32)
             totals = T.alloc_shared((32,), T.float32)
-            weights_ub = T.alloc_shared((320 if simd_weights else 24,), T.float32)
+            weights_ub = T.alloc_shared((5 * _SIMD_WEIGHT_STRIDE if simd_weights else 24,), T.float32)
             # SIMD reads and writes start on whole register boundaries.
             logits_ub = T.alloc_shared((6, 64), T.float32) if simd_weights else totals
             post_ub = T.alloc_shared((8,), T.float32)
@@ -345,7 +347,7 @@ def project_cube_fused(
                         for column_tile in T.serial(hidden // tile):
                             start = column_tile * tile
                             T.copy(streams[token, 0, start], streams_ub)
-                            _apply_weights(streams_ub, weights_ub, res_ub, layer_ub, tile, 64 if simd_weights else 4)
+                            _apply_weights(streams_ub, weights_ub, res_ub, layer_ub, tile, _SIMD_WEIGHT_STRIDE if simd_weights else 4)
                             T.copy(res_ub, x_res[token, 0, start])
                             T.copy(layer_ub, x_layer[token, start])
                     else:
