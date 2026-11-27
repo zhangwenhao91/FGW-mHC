@@ -65,7 +65,7 @@ def main():
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, 20, 1e-6)
             expected = pre_reference(*inputs)
 
-            for projection in ("cube", "cube_mk"):
+            for projection in ("cube", "cube_mk", "cube_full"):
                 def pair(launch=None):
                     options = {} if launch is None else {"_launch": launch}
                     residual, layer_in, weight = mhc_pre(*inputs, projection=projection, **options)

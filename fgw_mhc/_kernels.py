@@ -97,6 +97,26 @@ def project_cube(x, phi, partial, *, batch: int, width: int, chunk: int):
 
 
 @T.macro
+def _apply_weights(x_ub, weights_ub, res_ub, layer_ub, tile):
+    with T.SimdVF():
+        for chunk in T.serial(tile // 64):
+            col = chunk * 64
+            streams = S.alloc_local((4,), T.float32)
+            for i in T.unroll(4, explicit=True):
+                streams[i] = S.vcvt(S.vld(x_ub[i, col], dist="UNPK_B16"), T.float32, part=0)
+            acc = S.alloc_local((1,), T.float32)
+            acc[0] = S.vmul(streams[0], S.vld(weights_ub[0], dist="BRC_B32"))
+            for i in T.unroll(1, 4, explicit=True):
+                S.vmula(acc[0], streams[i], S.vld(weights_ub[i], dist="BRC_B32"))
+            S.vsts(layer_ub[col], S.vcvt(acc[0], T.bfloat16), dist="PK_B32")
+            for row in T.unroll(4, explicit=True):
+                acc[0] = S.vmul(streams[0], S.vld(weights_ub[4 + row * 4], dist="BRC_B32"))
+                for i in T.unroll(1, 4, explicit=True):
+                    S.vmula(acc[0], streams[i], S.vld(weights_ub[4 + row * 4 + i], dist="BRC_B32"))
+                S.vsts(res_ub[row, col], S.vcvt(acc[0], T.bfloat16), dist="PK_B32")
+
+
+@T.macro
 def _compute_weights(
     partial_ub, squares_ub, bias_ub, totals, weights_ub, post_ub,
     width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused,
@@ -156,8 +176,9 @@ def _compute_weights(
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def project_cube_fused(
-    x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, *,
+    x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, weights_read, x_res, x_layer, *,
     batch: int, width: int, chunk: int, cores: int, merge: bool,
+    tile: int = 64, full_pre: bool = False,
     repeat: int = 0, eps: float = 0.02,
     alpha_pre: float = 1.0, alpha_post: float = 1.0, alpha_res: float = 1.0,
 ):
@@ -179,6 +200,11 @@ def project_cube_fused(
     weights: T.Tensor[(batch, 24), T.float32]
     h_post: T.Tensor[(batch, 4), T.float32]
 
+    hidden = width // 4
+    weights_read: T.Tensor[(batch, 24), T.float32]
+    x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
+    x_layer: T.Tensor[(batch, hidden), T.bfloat16]
+
     with T.MixedKernel(cores) as (core, side):
         x_ub = T.alloc_shared((half, chunk), T.bfloat16)
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
@@ -199,6 +225,13 @@ def project_cube_fused(
             totals = T.alloc_shared((32,), T.float32)
             weights_ub = T.alloc_shared((24,), T.float32)
             post_ub = T.alloc_shared((8,), T.float32)
+
+        if full_pre:
+            streams_ub = T.alloc_shared((4, tile), T.bfloat16)
+            apply_weights_ub = T.alloc_shared((24,), T.float32)
+            res_ub = T.alloc_shared((4, tile), T.bfloat16)
+            layer_ub = T.alloc_shared((tile,), T.bfloat16)
+            streams = T.reshape(x, (batch, 4, hidden))
 
         T.set_hf32_mode("nearest_even")
         for step in T.Pipelined(jobs // cores):
@@ -256,12 +289,13 @@ def project_cube_fused(
                 T.ascend_sync_inter_wait("PIPE_MTE3", 1)
                 _drain = T.call_extern("int32", "FGW_SYNC", T.ascend_pipe_barrier("PIPE_MTE3"))
                 _ready = T.call_extern("int32", "FGW_SYNC", T.ascend_set_flag("MTE3_MTE2", 7))
+            first = core * 2 + side
+            coefficient_jobs = T.ceildiv(T.max(batch - first, 0), cores * 2)
             with T.Stage(0):
                 with T.Task():
                     T.ascend_wait_flag("MTE3_MTE2", 7)
                     T.copy(bias, bias_ub)
-                first = core * 2 + side
-                for step in T.serial(T.ceildiv(T.max(batch - first, 0), cores * 2)):
+                for step in T.serial(coefficient_jobs):
                     token = first + step * cores * 2
                     T.copy(partial_read[0:splits, token, 0:cols], partial_ub)
                     T.copy(squares_read[0:splits, token, 0:8], split_squares_ub)
@@ -269,8 +303,37 @@ def project_cube_fused(
                         partial_ub, split_squares_ub, bias_ub, totals, weights_ub, post_ub,
                         width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True,
                     )
-                    T.copy(weights_ub, weights[token, 0])
-                    T.copy(post_ub[0:4], h_post[token, 0])
+                    if not full_pre or step < coefficient_jobs - 1:
+                        T.copy(weights_ub, weights[token, 0])
+                        T.copy(post_ub[0:4], h_post[token, 0])
+
+            if full_pre:
+                with T.PerCoreTask():
+                    if coefficient_jobs > 0:
+                        with T.Task():
+                            last_token = first + (coefficient_jobs - 1) * cores * 2
+                            T.copy(weights_ub, weights[last_token, 0])
+                            T.copy(post_ub[0:4], h_post[last_token, 0])
+                    T.ascend_sync_inter_arrive("PIPE_MTE3", 2)
+                    T.ascend_sync_inter_wait("PIPE_MTE3", 2)
+                    _drain_apply = T.call_extern("int32", "FGW_SYNC", T.ascend_pipe_barrier("PIPE_MTE3"))
+                    _ready_apply = T.call_extern("int32", "FGW_SYNC", T.ascend_set_flag("MTE3_MTE2", 6))
+                tiles = hidden // tile
+                with T.Stage(0):
+                    with T.Task():
+                        T.ascend_wait_flag("MTE3_MTE2", 6)
+                        # All participants execute the wait, including idle Vector halves.
+                        T.copy(weights_read[T.min(first // tiles, batch - 1), 0], apply_weights_ub)
+                    for step in T.serial(T.ceildiv(T.max(batch * tiles - first, 0), cores * 2)):
+                        task = first + step * cores * 2
+                        token = task // tiles
+                        start = task % tiles * tile
+                        T.copy(streams[token, 0, start], streams_ub)
+                        if step > 0:
+                            T.copy(weights_read[token, 0], apply_weights_ub)
+                        _apply_weights(streams_ub, apply_weights_ub, res_ub, layer_ub, tile)
+                        T.copy(res_ub, x_res[token, 0, start])
+                        T.copy(layer_ub, x_layer[token, start])
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
@@ -336,22 +399,7 @@ def apply_mix(x, weights, x_res, x_layer, *, batch: int, hidden: int, tile: int)
             start = column_tile * tile
             T.copy(x[token, 0, start], x_ub)
             T.copy(weights[token, 0], weights_ub)
-            with T.SimdVF():
-                for chunk in T.serial(tile // 64):
-                    col = chunk * 64
-                    streams = S.alloc_local((4,), T.float32)
-                    for i in T.unroll(4, explicit=True):
-                        streams[i] = S.vcvt(S.vld(x_ub[i, col], dist="UNPK_B16"), T.float32, part=0)
-                    acc = S.alloc_local((1,), T.float32)
-                    acc[0] = S.vmul(streams[0], S.vld(weights_ub[0], dist="BRC_B32"))
-                    for i in T.unroll(1, 4, explicit=True):
-                        S.vmula(acc[0], streams[i], S.vld(weights_ub[i], dist="BRC_B32"))
-                    S.vsts(layer_ub[col], S.vcvt(acc[0], T.bfloat16), dist="PK_B32")
-                    for row in T.unroll(4, explicit=True):
-                        acc[0] = S.vmul(streams[0], S.vld(weights_ub[4 + row * 4], dist="BRC_B32"))
-                        for i in T.unroll(1, 4, explicit=True):
-                            S.vmula(acc[0], streams[i], S.vld(weights_ub[4 + row * 4 + i], dist="BRC_B32"))
-                        S.vsts(res_ub[row, col], S.vcvt(acc[0], T.bfloat16), dist="PK_B32")
+            _apply_weights(x_ub, weights_ub, res_ub, layer_ub, tile)
             T.copy(res_ub, x_res[token, 0, start])
             T.copy(layer_ub, x_layer[token, start])
 
