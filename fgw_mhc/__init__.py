@@ -59,14 +59,28 @@ def mhc_pre(
     _check_tensor("phi", phi, (width, mixes), torch.float32, device)
     _check_tensor("b", b, (mixes,), torch.float32, device)
 
-    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_split", "vector"):
-        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_full_tail', 'cube_full_k', 'cube_split', or 'vector'")
+    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_split", "vector"):
+        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_full_tail', 'cube_full_k', 'cube_m_only', 'cube_split', or 'vector'")
     if batch == 0:
         return torch.empty_like(x), x.new_empty((0, hidden)), b.new_empty((0, streams))
     if streams != 4 or hidden % 64:
         from .reference import pre_reference
 
         return pre_reference(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkhorn_eps)
+
+    if projection == "cube_m_only":
+        chunk = gcd(width, 256)
+        tile = hidden if hidden <= 4096 else gcd(hidden, 256)
+        kernel = _compile(
+            "project_cube_m_only", batch=batch, width=width, chunk=chunk, tile=tile,
+            repeat=sinkhorn_repeat, eps=float(sinkhorn_eps),
+            alpha_pre=float(alpha_pre), alpha_post=float(alpha_post), alpha_res=float(alpha_res),
+        )
+        x_res = torch.empty_like(x)
+        layer = x.new_empty((batch, hidden))
+        post = b.new_empty((batch, 4))
+        _launch("pre", kernel, x, phi, b, post, x_res.view(batch, 4, hidden), layer)
+        return x_res, layer, post
 
     cube = projection != "vector"
     full_pre = projection in ("cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k")

@@ -374,6 +374,111 @@ def project_cube_fused(
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
+def project_cube_m_only(
+    x, phi, bias, h_post, x_res, x_layer, *,
+    batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
+    alpha_pre: float, alpha_post: float, alpha_res: float,
+):
+    """Give one Cube group each M tile and accumulate all K locally."""
+    rows = 16
+    half = rows // 2
+    cols = 32
+    splits = width // chunk
+    row_tiles = (batch + rows - 1) // rows
+    cores = min(row_tiles, 28)
+    x: T.Tensor[(batch, width), T.bfloat16]
+    phi: T.Tensor[(width, 24), T.float32]
+    bias: T.Tensor[(24,), T.float32]
+    h_post: T.Tensor[(batch, 4), T.float32]
+
+    hidden = width // 4
+    x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
+    x_layer: T.Tensor[(batch, hidden), T.bfloat16]
+
+    with T.MixedKernel(cores) as (core, side):
+        x_ub = T.alloc_shared((half, chunk), T.bfloat16)
+        nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
+        T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
+        squares_ub = T.alloc_shared((half, 8), T.float32)
+        a_l1 = T.alloc_l1((rows, chunk), T.float32)
+        b_l1 = T.alloc_l1((chunk, cols), T.float32)
+        a_l0 = T.alloc_l0a((rows, chunk), T.float32)
+        b_l0 = T.alloc_l0b((cols, chunk), T.float32)
+        acc = T.alloc_l0c((rows, cols), T.float32)
+
+        raw_ub = T.alloc_shared((half, cols), T.float32)
+        partial_ub = T.alloc_shared((1, cols), T.float32)
+        sum_ub = T.alloc_shared((1, 8), T.float32)
+        bias_ub = T.alloc_shared((24,), T.float32)
+        totals = T.alloc_shared((32,), T.float32)
+        weights_ub = T.alloc_shared((24,), T.float32)
+        post_ub = T.alloc_shared((8,), T.float32)
+        streams_ub = T.alloc_shared((4, tile), T.bfloat16)
+        res_ub = T.alloc_shared((4, tile), T.bfloat16)
+        layer_ub = T.alloc_shared((tile,), T.bfloat16)
+        streams = T.reshape(x, (batch, 4, hidden))
+
+        T.set_hf32_mode("nearest_even")
+        for row_tile in T.Persistent([row_tiles], cores, core):
+            vector_m = row_tile * rows + side * half
+            for part in T.serial(splits):
+                k = part * chunk
+                # The tail load zero-pads any rows outside the real batch.
+                T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
+                T.copy(phi[k:k + chunk, 0:cols], b_l1)
+                with T.SimdVF():
+                    full = S.pset(32)
+                    first = S.pset(32, "PAT_VL1")
+                    eight = S.pset(32, "PAT_VL8")
+                    zero = S.vdup(T.float32(0), T.float32, full)
+                    nz_stride = T.int32((half + 1) << 16)
+                    valid_rows = T.min(T.max(batch - vector_m, 0), half)
+                    for row in T.serial(valid_rows):
+                        squared = S.alloc_local((1,), T.float32)
+                        squared[0] = zero
+                        for col_tile in T.unroll(chunk // 64, explicit=True):
+                            col = col_tile * 64
+                            values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
+                            ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                            S.vsstb(values, ptr, nz_stride, full)
+                            S.vmula(squared[0], values, values, full)
+                        total = S.vcadd(squared[0], full)
+                        if part > 0:
+                            total = S.vadd(total, S.vld(squares_ub[row, 0], dist="BRC_B32"), first)
+                        S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
+                    if valid_rows < half:
+                        for row_index in T.serial(half - valid_rows):
+                            row = valid_rows + row_index
+                            for col_tile in T.unroll(chunk // 64, explicit=True):
+                                col = col_tile * 64
+                                ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                                S.vsstb(zero, ptr, nz_stride, full)
+                            S.vsts(squares_ub[row, 0], zero, eight)
+                # Both Vector halves publish their rows to the same Cube L1 tile.
+                T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
+                T.copy(a_l1, a_l0)
+                T.copy(b_l1, b_l0, transpose=True)
+                T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=part == 0)
+            T.dual_copy(acc, raw_ub)
+            T.copy(bias, bias_ub)
+            for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
+                token = vector_m + row
+                T.copy(raw_ub[row:row + 1, :], partial_ub)
+                T.copy(squares_ub[row:row + 1, :], sum_ub)
+                _compute_weights(
+                    partial_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,
+                    width, 1, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, False,
+                )
+                for column_tile in T.serial(hidden // tile):
+                    offset = column_tile * tile
+                    T.copy(streams[token, 0, offset], streams_ub)
+                    _apply_weights(streams_ub, weights_ub, res_ub, layer_ub, tile, 4)
+                    T.copy(res_ub, x_res[token, 0, offset])
+                    T.copy(layer_ub, x_layer[token, offset])
+                T.copy(post_ub[0:4], h_post[token, 0])
+
+
+@tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def mix(
     partial, squares, bias, weights, h_post, *,
     batch: int, width: int, splits: int, repeat: int, eps: float,

@@ -14,9 +14,11 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--post-streams", action="store_true", help="Time Post only with 1, 2, or 4 streams per task")
     mode.add_argument("--post-pipeline", action="store_true", help="Compare default, capped, and triple-buffered Post")
+    mode.add_argument("--m-only", action="store_true", help="Compare cube_full with M-only Pre")
     mode.add_argument("--split-k", action="store_true", help="Compare cube_full with one split-K job per core")
     mode.add_argument("--tail", action="store_true", help="Compare cube_full with valid-row preparation")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
+    parser.add_argument("--pre-only", action="store_true", help="Time Pre without Post")
     parser.add_argument("--post-cores", type=int, choices=range(1, 57), metavar="1..56", default=8)
     parser.add_argument("--batch", type=int, choices=tuple(batch for batch, _ in CASES), default=2)
     parser.add_argument("--device", default="npu:0")
@@ -27,6 +29,9 @@ def main():
     args = parser.parse_args()
     if min(args.cycles, args.warmup, args.repeat) < 1:
         parser.error("cycles, warmup and repeat must be positive")
+
+    if args.pre_only and not args.m_only:
+        parser.error("--pre-only requires --m-only")
 
     import torch
     import torch_npu  # noqa: F401
@@ -50,7 +55,7 @@ def main():
     phi = phi.to(device)
     bias = bias.to(device)
     layer = layer.to(device, torch.bfloat16)
-    inputs = (phi, x, bias, 1.0, 1.0, 1.0, 20, 1e-6)
+    inputs = (phi, x, bias, 1.0, 1.0, 1.0, *((1, 0.02) if args.m_only else (20, 1e-6)))
 
     if args.post_streams:
         weights = torch.randn(batch, 4, generator=rng).to(device)
@@ -61,6 +66,8 @@ def main():
             return mhc_post(*post_inputs, streams_per_task=int(route))
         projection = "cube_full" if args.post_pipeline else route
         residual, layer_in, post = mhc_pre(*inputs, projection=projection)
+        if args.pre_only:
+            return residual, layer_in, post
         options = {}
         if args.post_pipeline and route != "post_default":
             options = {"num_vec_cores": args.post_cores, "pipeline": route == "post_triple"}
@@ -70,7 +77,9 @@ def main():
         expected = post_reference(*post_inputs)
     else:
         residual, layer_in, post = pre_reference(*inputs)
-        expected = (residual, layer_in, post, post_reference(layer, post, residual))
+        expected = (residual, layer_in, post)
+        if not args.pre_only:
+            expected += (post_reference(layer, post, residual),)
     routes = ROUTES
     if args.post_streams:
         routes = ("1", "2", "4")
@@ -78,6 +87,8 @@ def main():
         routes = ("post_default", "post_capped", "post_triple")
     elif args.simd:
         routes = ("cube_full", "cube_full_simd")
+    elif args.m_only:
+        routes = ("cube_full", "cube_m_only")
     elif args.split_k:
         routes = ("cube_full", "cube_full_k")
     elif args.tail:
@@ -91,6 +102,8 @@ def main():
     with open(args.output, "w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
         variant, metric = ("streams_per_task", "post_us") if args.post_streams else ("projection", "pair_us")
+        if args.pre_only:
+            metric = "pre_us"
         writer.writerow(("batch", "hidden", "cycle", "order", "position", variant, metric))
         for cycle in range(1, args.cycles + 1):
             for order in permutations(routes):
