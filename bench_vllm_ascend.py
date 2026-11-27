@@ -8,6 +8,7 @@ import os
 import sys
 from importlib.util import find_spec
 from pathlib import Path
+from statistics import median
 
 from bench_mhc import CASES, time_us
 
@@ -68,6 +69,48 @@ def prepare_vllm_opp():
     )
 
 
+def summarize_profile(directory, backend, steps):
+    """Report device durations and gaps for consecutive native Pre/Post launches."""
+    reports = list(directory.rglob("kernel_details.csv"))
+    if not reports:
+        print(f"No kernel_details.csv under {directory}", flush=True)
+        return
+    report = max(reports, key=lambda path: path.stat().st_mtime_ns)
+    events = []
+    with report.open(newline="", encoding="utf-8-sig") as source:
+        reader = csv.DictReader(source)
+        columns = {name.strip().lower().replace(" ", ""): name for name in reader.fieldnames or ()}
+        required = ("name", "starttime(us)", "duration(us)")
+        if any(name not in columns for name in required):
+            print(f"{report}: unexpected profiler columns {reader.fieldnames}", flush=True)
+            return
+        name_col, start_col, duration_col = (columns[name] for name in required)
+        for row in reader:
+            name = row[name_col].lower()
+            if ("project_cube_fused" in name if backend == "tilelang" else "hcpre" in name):
+                stage = "pre"
+            elif ("post" in name if backend == "tilelang" else "hcpost" in name):
+                stage = "post"
+            else:
+                continue
+            events.append((float(row[start_col]), float(row[duration_col]), stage, row[name_col]))
+    events.sort(key=lambda event: event[0])
+    if [event[2] for event in events] != ["pre", "post"] * steps:
+        print(f"{report}: expected {steps} alternating Pre/Post pairs, matched "
+              f"{[(event[2], event[3]) for event in events]}", flush=True)
+        return
+    pairs = list(zip(events[::2], events[1::2]))
+    totals = (
+        median(pre[1] for pre, post in pairs),
+        median(post[1] for pre, post in pairs),
+        median(post[0] - (pre[0] + pre[1]) for pre, post in pairs),
+        median(post[0] + post[1] - pre[0] for pre, post in pairs),
+    )
+    print(f"{backend} device medians across {steps} profiled pairs: pre={totals[0]:.3f} us, "
+          f"post={totals[1]:.3f} us, pre_to_post_gap={totals[2]:.3f} us, "
+          f"pair_span={totals[3]:.3f} us", flush=True)
+
+
 def profile_pair(pair, torch, profiler, directory, warmup, steps):
     for _ in range(warmup):
         pair()
@@ -113,8 +156,8 @@ def main():
     parser.add_argument("--tileops-spec", action="store_true", help="Use TileOPs mHC manifest Sinkhorn settings")
     args = parser.parse_args()
     if args.tileops_spec:
-        if args.merge or args.backend == "both" or args.profile_dir or args.sweep_pairs:
-            parser.error("--tileops-spec requires a single backend and standard pair or stage timing")
+        if args.merge or args.backend == "both" or args.sweep_pairs:
+            parser.error("--tileops-spec requires a single backend and does not support event sweeps")
         args.sinkhorn_iters = 1
     if args.profile_dir and (args.merge or args.split_stages or args.backend == "both"):
         parser.error("--profile-dir requires one backend and continuous pair execution")
@@ -322,6 +365,7 @@ def main():
                                                 args.warmup, args.repeat, phase, f"{latency:.6f}"))
                         summary.flush()
                         print(f"{args.backend} B={batch} H={hidden} {phase} trace: {latency:.3f} us", flush=True)
+                summarize_profile(directory, args.backend, args.profile_steps)
                 print(f"Trace for {args.backend} B={batch} H={hidden}: {directory}", flush=True)
                 continue
 
