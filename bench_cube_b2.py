@@ -18,6 +18,7 @@ def main():
     mode.add_argument("--split-k", action="store_true", help="Compare cube_full with one split-K job per core")
     mode.add_argument("--tail", action="store_true", help="Compare cube_full with valid-row preparation")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
+    parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
     parser.add_argument("--pre-only", action="store_true", help="Time Pre without Post")
     parser.add_argument("--post-cores", type=int, choices=range(1, 57), metavar="1..56", default=8)
     parser.add_argument("--batch", type=int, choices=tuple(batch for batch, _ in CASES), default=2)
@@ -30,6 +31,8 @@ def main():
     if min(args.cycles, args.warmup, args.repeat) < 1:
         parser.error("cycles, warmup and repeat must be positive")
 
+    if args.debug_m_only and not args.m_only:
+        parser.error("--debug-m-only requires --m-only")
     if args.pre_only and not args.m_only:
         parser.error("--pre-only requires --m-only")
 
@@ -56,6 +59,26 @@ def main():
     bias = bias.to(device)
     layer = layer.to(device, torch.bfloat16)
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, *((1, 0.02) if args.m_only else (20, 1e-6)))
+
+    if args.debug_m_only:
+        from math import gcd
+        from fgw_mhc import _compile
+
+        kernel = _compile(
+            "project_cube_m_only", batch=batch, width=width, chunk=gcd(width, 256), tile=hidden,
+            repeat=1, eps=0.02, alpha_pre=1.0, alpha_post=1.0, alpha_res=1.0, debug=True,
+        )
+        trace = bias.new_empty((batch, 32))
+        kernel(x, phi, bias, bias.new_empty((batch, 4)),
+               torch.empty_like(x).view(batch, 4, hidden), torch.empty_like(layer), trace)
+        flat = x.float()
+        expected_projection = flat @ phi
+        expected_squares = flat.square().sum(-1)
+        for name, actual, reference in (
+            ("projection", trace[:, :24], expected_projection),
+            ("squares", trace[:, 24], expected_squares),
+        ):
+            print(f"{name} actual={actual.tolist()} expected={reference.tolist()}", flush=True)
 
     if args.post_streams:
         weights = torch.randn(batch, 4, generator=rng).to(device)

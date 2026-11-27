@@ -375,9 +375,9 @@ def project_cube_fused(
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def project_cube_m_only(
-    x, phi, bias, h_post, x_res, x_layer, *,
+    x, phi, bias, h_post, x_res, x_layer, trace, *,
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
-    alpha_pre: float, alpha_post: float, alpha_res: float,
+    alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     rows = 16
@@ -391,6 +391,7 @@ def project_cube_m_only(
     bias: T.Tensor[(24,), T.float32]
     h_post: T.Tensor[(batch, 4), T.float32]
 
+    trace: T.Tensor[(batch, 32 if debug else 4), T.float32]
     hidden = width // 4
     x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
     x_layer: T.Tensor[(batch, hidden), T.bfloat16]
@@ -472,6 +473,9 @@ def project_cube_m_only(
                 token = vector_m + row
                 T.copy(raw_ub[row:row + 1, :], partial_ub)
                 T.copy(squares_ub[row:row + 1, :], sum_ub)
+                if debug:
+                    T.copy(partial_ub[0, 0:24], trace[token, 0:24])
+                    T.copy(sum_ub[0, 0:8], trace[token, 24:32])
                 _compute_weights(
                     partial_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,
                     width, 1, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, False,

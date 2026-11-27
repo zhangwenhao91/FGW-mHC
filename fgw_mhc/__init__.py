@@ -79,7 +79,7 @@ def mhc_pre(
         x_res = torch.empty_like(x)
         layer = x.new_empty((batch, hidden))
         post = b.new_empty((batch, 4))
-        _launch("pre", kernel, x, phi, b, post, x_res.view(batch, 4, hidden), layer)
+        _launch("pre", kernel, x, phi, b, post, x_res.view(batch, 4, hidden), layer, post)
         return x_res, layer, post
 
     cube = projection != "vector"
