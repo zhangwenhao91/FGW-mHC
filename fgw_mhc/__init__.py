@@ -130,7 +130,7 @@ def mhc_pre(
     return x_res, x_layer, h_post
 
 
-def mhc_post(x_layer_out, h_post, x_res):
+def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56):
     """Return the flattened BF16 residual plus the scaled layer output."""
     batch, hidden = _check_input(x_layer_out)
     device = x_layer_out.device
@@ -138,7 +138,13 @@ def mhc_post(x_layer_out, h_post, x_res):
     _check_tensor("h_post", h_post, (batch, 4), torch.float32, device)
     _check_tensor("x_res", x_res, (batch, 4 * hidden), torch.bfloat16, device)
 
-    kernel = _compile("post", batch=batch, hidden=hidden, tile=gcd(hidden, 256))
+    if type(num_vec_cores) is not int or not 1 <= num_vec_cores <= 56:
+        raise ValueError("num_vec_cores must be an integer from 1 to 56")
+    tile = gcd(hidden, 256)
+    jobs = batch * (hidden // tile)
+    cores = min(jobs, num_vec_cores)
+    stages = 3 if pipeline and jobs > cores else 0
+    kernel = _compile("post", batch=batch, hidden=hidden, tile=tile, cores=cores, stages=stages)
     out = torch.empty_like(x_res)
     kernel(x_layer_out, h_post, x_res.view(batch, 4, hidden), out.view(batch, 4, hidden))
     return out

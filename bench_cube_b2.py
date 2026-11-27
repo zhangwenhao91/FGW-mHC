@@ -12,9 +12,11 @@ ROUTES = ("cube", "cube_mk", "cube_full")
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--post-pipeline", action="store_true", help="Compare default, capped, and triple-buffered Post")
     mode.add_argument("--split-k", action="store_true", help="Compare cube_full with one split-K job per core")
     mode.add_argument("--tail", action="store_true", help="Compare cube_full with valid-row preparation")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
+    parser.add_argument("--post-cores", type=int, choices=range(1, 57), metavar="1..56", default=8)
     parser.add_argument("--batch", type=int, choices=tuple(batch for batch, _ in CASES), default=2)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--cycles", type=int, default=2, help="Repeats of all route orders")
@@ -50,13 +52,19 @@ def main():
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, 20, 1e-6)
 
     def run(route):
-        residual, layer_in, post = mhc_pre(*inputs, projection=route)
-        return residual, layer_in, post, mhc_post(layer, post, residual)
+        projection = "cube_full" if args.post_pipeline else route
+        residual, layer_in, post = mhc_pre(*inputs, projection=projection)
+        options = {}
+        if args.post_pipeline and route != "post_default":
+            options = {"num_vec_cores": args.post_cores, "pipeline": route == "post_triple"}
+        return residual, layer_in, post, mhc_post(layer, post, residual, **options)
 
     residual, layer_in, post = pre_reference(*inputs)
     expected = (residual, layer_in, post, post_reference(layer, post, residual))
     routes = ROUTES
-    if args.simd:
+    if args.post_pipeline:
+        routes = ("post_default", "post_capped", "post_triple")
+    elif args.simd:
         routes = ("cube_full", "cube_full_simd")
     elif args.split_k:
         routes = ("cube_full", "cube_full_k")

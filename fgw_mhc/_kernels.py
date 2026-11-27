@@ -442,20 +442,25 @@ def apply_mix(x, weights, x_res, x_layer, *, batch: int, hidden: int, tile: int)
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
-def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int):
+def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int, cores: int, stages: int):
     tiles = hidden // tile
     x_layer: T.Tensor[(batch, hidden), T.bfloat16]
     h_post: T.Tensor[(batch, 4), T.float32]
     x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
     out: T.Tensor[(batch, 4, hidden), T.bfloat16]
 
-    cores = min(batch * tiles, 56)
     with T.Kernel(cores) as core:
         layer_ub = T.alloc_shared((tile,), T.bfloat16)
         post_ub = T.alloc_shared((8,), T.float32)
         res_ub = T.alloc_shared((4, tile), T.bfloat16)
         out_ub = T.alloc_shared((4, tile), T.bfloat16)
-        for token, column_tile in T.Persistent([batch, tiles], cores, core, group_size=1):
+        if stages > 0:
+            T.annotate_buffer_versions({
+                layer_ub: stages, post_ub: stages, res_ub: stages, out_ub: stages,
+            })
+        for token, column_tile in T.Persistent(
+            [batch, tiles], cores, core, group_size=1, num_stages=stages,
+        ):
             start = column_tile * tile
             T.copy(x_layer[token, start], layer_ub)
             T.copy(h_post[token, 0], post_ub[0:4])

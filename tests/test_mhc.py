@@ -43,3 +43,16 @@ def test_pre_post(device, batch, hidden, repeat, projection):
     torch.testing.assert_close(
         result.cpu(), post_reference(layer_out, post_weights, residual), atol=0.01, rtol=0.01
     )
+
+@pytest.mark.parametrize("batch,hidden", [(1, 1280), (2, 1920), (4, 2560)])
+def test_post_pipeline(device, batch, hidden):
+    rng = torch.Generator().manual_seed(42)
+    layer = torch.randn(batch, hidden, generator=rng).bfloat16()
+    weights = torch.randn(batch, 4, generator=rng)
+    residual = torch.randn(batch, 4 * hidden, generator=rng).bfloat16()
+    expected = post_reference(layer, weights, residual)
+    actual = mhc_post(
+        layer.to(device), weights.to(device), residual.to(device),
+        pipeline=True, num_vec_cores=2 if batch == 1 else 8,
+    )
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.01)
