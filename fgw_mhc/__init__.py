@@ -60,7 +60,7 @@ def mhc_pre(
     _check_tensor("b", b, (mixes,), torch.float32, device)
 
     grouped_routes = {"cube_full_g2": 2, "cube_full_g4": 4}
-    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_split", "vector", *grouped_routes):
+    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd_reduce", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_split", "vector", *grouped_routes):
         raise ValueError(f"Unknown mHC projection {projection!r}")
     if pre_tile is not None and (
         projection != "cube_full" or streams != 4 or hidden % 64 or type(pre_tile) is not int
@@ -89,7 +89,7 @@ def mhc_pre(
         return x_res, layer, post
 
     cube = projection != "vector"
-    full_pre = projection in (*grouped_routes, "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k")
+    full_pre = projection in (*grouped_routes, "cube_full", "cube_full_simd_reduce", "cube_full_simd", "cube_full_tail", "cube_full_k")
     merge = full_pre or projection == "cube_mk"
     fused = merge or projection == "cube"
     chunk = gcd(width, 256)
@@ -131,6 +131,7 @@ def mhc_pre(
             **(coefficient_config if merge else {}),
             full_pre=full_pre, tile=tile if full_pre else 64, simd_weights=simd_weights,
             skip_padding=projection == "cube_full_tail", k_group=k_group,
+            simd_reduce=projection == "cube_full_simd_reduce",
         )
         squares = torch.empty((splits, padded_batch, 8), device=device, dtype=torch.float32)
         # Read aliases express the workspace publication boundary to the scheduler.

@@ -56,6 +56,7 @@ def replay_stage_times(run, torch, warmup, repeat, launches_per_event):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--simd-reduce", action="store_true", help="Compare baseline and SIMD partial reduction")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
     parser.add_argument("--launches-per-event", type=int, default=1,
@@ -91,7 +92,8 @@ def main():
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, iters, eps)
             expected = pre_reference(*inputs)
 
-            for projection in ("cube", "cube_mk", "cube_full"):
+            routes = ("cube_full", "cube_full_simd_reduce") if args.simd_reduce else ("cube", "cube_mk", "cube_full")
+            for projection in routes:
                 def pair(launch=None):
                     options = {} if launch is None else {"_launch": launch}
                     residual, layer_in, weight = mhc_pre(*inputs, projection=projection, **options)
@@ -102,7 +104,13 @@ def main():
                 torch.testing.assert_close(
                     mhc_pre(*inputs, projection=projection), expected, atol=0.01, rtol=0.01
                 )
-                total = time_us(pair, torch, args.warmup, args.repeat)
+                pair_count = args.launches_per_event if args.simd_reduce else 1
+
+                def submit_pairs():
+                    for _ in range(pair_count):
+                        pair()
+
+                total = time_us(submit_pairs if pair_count > 1 else pair, torch, args.warmup, args.repeat) / pair_count
                 if args.launches_per_event == 1:
                     stages = stage_times(pair, torch, args.repeat)
                 else:
@@ -111,7 +119,7 @@ def main():
                     stages["project_plus_mix"] = stages["project"] + stages["mix"]
                 stages["pair"] = total
                 for stage, elapsed in stages.items():
-                    count = 1 if stage == "pair" else args.launches_per_event
+                    count = pair_count if stage == "pair" else args.launches_per_event
                     writer.writerow((batch, hidden, projection, stage, f"{elapsed:.3f}", count, iters, eps))
                 output.flush()
                 print(f"B={batch} H={hidden} {projection}: " +

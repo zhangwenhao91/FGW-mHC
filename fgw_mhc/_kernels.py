@@ -151,25 +151,40 @@ def _normalize_simd(logits_ub, weights_ub, post_ub, repeat, eps):
 def _compute_weights(
     partial_ub, squares_ub, bias_ub, totals, weights_ub, post_ub, logits_ub,
     width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused, simd_weights,
-    projection_row=None,
+    projection_row=None, simd_reduce=False,
 ):
-    with T.SimtVF(threads=32):
-        for q in T.Parallel(32):
-            value = T.alloc_var(T.float32, init=0.0)
-            if cube and q == 24:
-                for split in T.serial(splits):
-                    if fused:
-                        value += squares_ub[split, 0]
-                    else:
-                        for lane in T.unroll(8):
-                            value += squares_ub[split, lane]
-            else:
-                if projection_row is not None:
-                    value += partial_ub[projection_row, q]
-                else:
+    if simd_reduce:
+        with T.SimdVF():
+            channels = S.pset(32, "PAT_VL32")
+            first = S.pset(32, "PAT_VL1")
+            projection_sum = S.alloc_local((1,), T.float32)
+            square_sum = S.alloc_local((1,), T.float32)
+            projection_sum[0] = S.vdup(T.float32(0), T.float32, channels)
+            square_sum[0] = S.vdup(T.float32(0), T.float32, first)
+            for split in T.serial(splits):
+                projection_sum[0] = S.vadd(projection_sum[0], S.vld(partial_ub[split, 0]), channels)
+                squares = S.vld(squares_ub[split, 0], dist="BRC_B32")
+                square_sum[0] = S.vadd(square_sum[0], squares, first)
+            S.vsts(totals[0], projection_sum[0], channels)
+            S.vsts(totals[24], square_sum[0], first)
+    else:
+        with T.SimtVF(threads=32):
+            for q in T.Parallel(32):
+                value = T.alloc_var(T.float32, init=0.0)
+                if cube and q == 24:
                     for split in T.serial(splits):
-                        value += partial_ub[split, q]
-            totals[q] = value
+                        if fused:
+                            value += squares_ub[split, 0]
+                        else:
+                            for lane in T.unroll(8):
+                                value += squares_ub[split, lane]
+                else:
+                    if projection_row is not None:
+                        value += partial_ub[projection_row, q]
+                    else:
+                        for split in T.serial(splits):
+                            value += partial_ub[split, q]
+                totals[q] = value
     if simd_weights:
         with T.SimtVF(threads=32):
             for q in T.Parallel(24):
@@ -222,6 +237,7 @@ def project_cube_fused(
     x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, x_res, x_layer, *,
     batch: int, width: int, chunk: int, cores: int, merge: bool,
     tile: int = 64, full_pre: bool = False, simd_weights: bool = False, skip_padding: bool = False, k_group: int = 1,
+    simd_reduce: bool = False,
     repeat: int = 0, eps: float = 0.02,
     alpha_pre: float = 1.0, alpha_post: float = 1.0, alpha_res: float = 1.0,
 ):
@@ -265,7 +281,8 @@ def project_cube_fused(
         if merge:
             T.import_source("#define FGW_SYNC(...) ({ __VA_ARGS__; 0; })\n")
             raw_ub = T.alloc_shared((half, cols), T.float32)
-            partial_ub = T.alloc_shared((splits, cols), T.float32)
+            # SIMD loads 64 FP32 lanes, so leave one 32-column row of padding.
+            partial_ub = T.alloc_shared((splits + int(simd_reduce), cols), T.float32)
             split_squares_ub = T.alloc_shared((splits, 8), T.float32)
             bias_ub = T.alloc_shared((24,), T.float32)
             totals = T.alloc_shared((32,), T.float32)
@@ -411,11 +428,15 @@ def project_cube_fused(
                     T.copy(bias, bias_ub[0:24])
                 for step in T.serial(coefficient_jobs):
                     token = first + step * cores * 2
-                    T.copy(partial_read[0:splits, token, 0:cols], partial_ub)
+                    if simd_reduce:
+                        T.copy(partial_read[0:splits, token, 0:cols], partial_ub[0:splits, 0:cols])
+                    else:
+                        T.copy(partial_read[0:splits, token, 0:cols], partial_ub)
                     T.copy(squares_read[0:splits, token, 0:8], split_squares_ub)
                     _compute_weights(
                         partial_ub, split_squares_ub, bias_ub, totals, weights_ub, post_ub, logits_ub,
                         width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, simd_weights,
+                        simd_reduce=simd_reduce,
                     )
                     if full_pre:
                         # Keep each token's weights on the Vector half that computed them.
