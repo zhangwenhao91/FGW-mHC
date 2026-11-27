@@ -400,7 +400,7 @@ def project_cube_m_only(
         x_ub = T.alloc_shared((half, chunk), T.bfloat16)
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
-        squares_ub = T.alloc_shared((half, 8), T.float32)
+        squares_ub = T.alloc_shared((splits, half, 8), T.float32)
         a_l1 = T.alloc_l1((rows, chunk), T.float32)
         b_l1 = T.alloc_l1((chunk, cols), T.float32)
         a_l0 = T.alloc_l0a((rows, chunk), T.float32)
@@ -422,7 +422,7 @@ def project_cube_m_only(
         T.set_hf32_mode("nearest_even")
         for row_tile in T.Persistent([row_tiles], cores, core):
             vector_m = row_tile * rows + side * half
-            for part in T.serial(splits):
+            for part in T.Pipelined(splits, num_stages=1):
                 k = part * chunk
                 # The tail load zero-pads any rows outside the real batch.
                 T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
@@ -444,12 +444,7 @@ def project_cube_m_only(
                             S.vsstb(values, ptr, nz_stride, full)
                             S.vmula(squared[0], values, values, full)
                         total = S.vcadd(squared[0], full)
-                        if part == 0:
-                            S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
-                        else:
-                            previous = S.vld(squares_ub[row, 0], dist="BRC_B32")
-                            accumulated = S.vadd(total, previous, first)
-                            S.vsts(squares_ub[row, 0], S.vsel(accumulated, zero, first), eight)
+                        S.vsts(squares_ub[part, row, 0], S.vsel(total, zero, first), eight)
                     if valid_rows < half:
                         for row_index in T.serial(half - valid_rows):
                             row = valid_rows + row_index
@@ -457,7 +452,6 @@ def project_cube_m_only(
                                 col = col_tile * 64
                                 ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
                                 S.vsstb(zero, ptr, nz_stride, full)
-                            S.vsts(squares_ub[row, 0], zero, eight)
                 # Both Vector halves publish their rows to the same Cube L1 tile.
                 T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
                 T.copy(a_l1, a_l0)
@@ -472,7 +466,13 @@ def project_cube_m_only(
             for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
                 token = vector_m + row
                 T.copy(raw_ub[row:row + 1, :], partial_ub)
-                T.copy(squares_ub[row:row + 1, :], sum_ub)
+                with T.SimtVF(threads=32):
+                    for lane in T.Parallel(8):
+                        value = T.alloc_var(T.float32, init=0.0)
+                        if lane == 0:
+                            for part in T.serial(splits):
+                                value += squares_ub[part, row, 0]
+                        sum_ub[0, lane] = value
                 if debug:
                     T.copy(partial_ub[0, 0:24], trace[token, 0:24])
                     T.copy(sum_ub[0, 0:8], trace[token, 24:32])
