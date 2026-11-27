@@ -31,9 +31,13 @@ def _compile(stage, **config):
     return getattr(_kernels, stage).compile(**config)
 
 
+def _run_kernel(name, kernel, *args):
+    kernel(*args)
+
+
 def mhc_pre(
     phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat,
-    sinkhorn_eps=0.02, *, projection="cube",
+    sinkhorn_eps=0.02, *, projection="cube", _launch=_run_kernel,
 ):
     """Return (x_res, x_layer, h_post) for four residual streams.
 
@@ -87,16 +91,17 @@ def mhc_pre(
         )
         squares = torch.empty((splits, padded_batch, 8), device=device, dtype=torch.float32)
         # Read aliases express the workspace publication boundary to the scheduler.
-        project(x, phi, partial, squares, partial, squares, b, weights, h_post)
+        stage = "project_and_mix" if merge else "project"
+        _launch(stage, project, x, phi, partial, squares, partial, squares, b, weights, h_post)
     elif cube:
         prepare = _compile("prepare_cube", **launch)
         project = _compile("project_cube", **launch)
         promoted = torch.empty((batch, width), device=device, dtype=torch.float32)
         squares = torch.empty((batch, splits, 8), device=device, dtype=torch.float32)
-        prepare(x, promoted, squares)
-        project(promoted, phi, partial)
+        _launch("prepare", prepare, x, promoted, squares)
+        _launch("project", project, promoted, phi, partial)
     else:
-        _compile("project", **launch)(x, phi, partial)
+        _launch("project", _compile("project", **launch), x, phi, partial)
         # The Vector specialization reads its RMS statistics from partial.
         squares = partial
     if not merge:
@@ -104,8 +109,8 @@ def mhc_pre(
             "mix", batch=batch, width=width, splits=splits, cube=cube, fused=fused,
             **coefficient_config,
         )
-        mixing(partial, squares, b, weights, h_post)
-    apply(x.view(batch, 4, hidden), weights, x_res.view(batch, 4, hidden), x_layer)
+        _launch("mix", mixing, partial, squares, b, weights, h_post)
+    _launch("apply_mix", apply, x.view(batch, 4, hidden), weights, x_res.view(batch, 4, hidden), x_layer)
     return x_res, x_layer, h_post
 
 
