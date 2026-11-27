@@ -59,8 +59,9 @@ def mhc_pre(
     _check_tensor("phi", phi, (width, mixes), torch.float32, device)
     _check_tensor("b", b, (mixes,), torch.float32, device)
 
-    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_split", "vector"):
-        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_full_tail', 'cube_full_k', 'cube_m_only', 'cube_split', or 'vector'")
+    grouped_routes = {"cube_full_g2": 2, "cube_full_g4": 4}
+    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_split", "vector", *grouped_routes):
+        raise ValueError(f"Unknown mHC projection {projection!r}")
     if batch == 0:
         return torch.empty_like(x), x.new_empty((0, hidden)), b.new_empty((0, streams))
     if streams != 4 or hidden % 64:
@@ -83,7 +84,7 @@ def mhc_pre(
         return x_res, layer, post
 
     cube = projection != "vector"
-    full_pre = projection in ("cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k")
+    full_pre = projection in (*grouped_routes, "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k")
     merge = full_pre or projection == "cube_mk"
     fused = merge or projection == "cube"
     chunk = gcd(width, 256)
@@ -94,7 +95,10 @@ def mhc_pre(
             if width % candidate == 0 and row_tiles * (width // candidate) <= 28:
                 chunk = candidate
                 break
-    splits = width // chunk
+    k_group = grouped_routes.get(projection, 1)
+    if width % (chunk * k_group):
+        raise ValueError(f"{projection} requires K divisible by {chunk * k_group}")
+    splits = width // (chunk * k_group)
     tile = hidden if full_pre and hidden <= 4096 else gcd(hidden, 256)
     padded_batch = (batch + 15) // 16 * 16
     launch = dict(batch=batch, width=width, chunk=chunk)
@@ -121,7 +125,7 @@ def mhc_pre(
             "project_cube_fused", **launch, cores=cores, merge=merge,
             **(coefficient_config if merge else {}),
             full_pre=full_pre, tile=tile if full_pre else 64, simd_weights=simd_weights,
-            skip_padding=projection == "cube_full_tail",
+            skip_padding=projection == "cube_full_tail", k_group=k_group,
         )
         squares = torch.empty((splits, padded_batch, 8), device=device, dtype=torch.float32)
         # Read aliases express the workspace publication boundary to the scheduler.

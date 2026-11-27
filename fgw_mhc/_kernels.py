@@ -221,12 +221,12 @@ def _compute_weights(
 def project_cube_fused(
     x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, x_res, x_layer, *,
     batch: int, width: int, chunk: int, cores: int, merge: bool,
-    tile: int = 64, full_pre: bool = False, simd_weights: bool = False, skip_padding: bool = False,
+    tile: int = 64, full_pre: bool = False, simd_weights: bool = False, skip_padding: bool = False, k_group: int = 1,
     repeat: int = 0, eps: float = 0.02,
     alpha_pre: float = 1.0, alpha_post: float = 1.0, alpha_res: float = 1.0,
 ):
     """Prepare X on paired Vector cores and feed Cube without a GM conversion buffer."""
-    splits = width // chunk
+    splits = width // (chunk * k_group)
     rows = 16
     half = rows // 2
     cols = 32
@@ -254,6 +254,8 @@ def project_cube_fused(
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
         squares_ub = T.alloc_shared((half, 8), T.float32)
+        if k_group > 1:
+            local_squares = T.alloc_shared((k_group, half, 8), T.float32)
         a_l1 = T.alloc_l1((rows, chunk), T.float32)
         b_l1 = T.alloc_l1((chunk, cols), T.float32)
         a_l0 = T.alloc_l0a((rows, mad_k), T.float32)
@@ -283,54 +285,105 @@ def project_cube_fused(
             job = step * cores + core
             part = job // row_tiles
             m = job % row_tiles * rows
-            k = part * chunk
             vector_m = m + side * half
-            # The tail load zero-pads any rows outside the real batch.
-            T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
-            T.copy(phi[k:k + chunk, 0:cols], b_l1)
-            with T.SimdVF():
-                full = S.pset(32)
-                first = S.pset(32, "PAT_VL1")
-                eight = S.pset(32, "PAT_VL8")
-                zero = S.vdup(T.float32(0), T.float32, full)
-                nz_stride = T.int32((half + 1) << 16)
-                valid_rows = T.min(T.max(batch - vector_m, 0), half) if skip_padding else half
-                for row in T.serial(valid_rows):
-                    squared = S.alloc_local((1,), T.float32)
-                    squared[0] = zero
-                    for col_tile in T.unroll(chunk // 64, explicit=True):
-                        col = col_tile * 64
-                        values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
-                        ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
-                        S.vsstb(values, ptr, nz_stride, full)
-                        S.vmula(squared[0], values, values, full)
-                    total = S.vcadd(squared[0], full)
-                    S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
-                if skip_padding:
-                    for row_index in T.serial(half - valid_rows):
-                        row = valid_rows + row_index
+            if k_group == 1:
+                k = part * chunk
+                # The tail load zero-pads any rows outside the real batch.
+                T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
+                T.copy(phi[k:k + chunk, 0:cols], b_l1)
+                with T.SimdVF():
+                    full = S.pset(32)
+                    first = S.pset(32, "PAT_VL1")
+                    eight = S.pset(32, "PAT_VL8")
+                    zero = S.vdup(T.float32(0), T.float32, full)
+                    nz_stride = T.int32((half + 1) << 16)
+                    valid_rows = T.min(T.max(batch - vector_m, 0), half) if skip_padding else half
+                    for row in T.serial(valid_rows):
+                        squared = S.alloc_local((1,), T.float32)
+                        squared[0] = zero
                         for col_tile in T.unroll(chunk // 64, explicit=True):
                             col = col_tile * 64
+                            values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
                             ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
-                            S.vsstb(zero, ptr, nz_stride, full)
-                        S.vsts(squares_ub[row, 0], zero, eight)
-            # Both Vector halves publish their rows to the same Cube L1 tile.
-            T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
-            if not merge or step < jobs // cores - 1:
-                T.copy(squares_ub, squares[part, vector_m:vector_m + half, 0:8])
-            if chunk == mad_k:
-                T.copy(a_l1, a_l0)
-                T.copy(b_l1, b_l0, transpose=True)
-                T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=True)
+                            S.vsstb(values, ptr, nz_stride, full)
+                            S.vmula(squared[0], values, values, full)
+                        total = S.vcadd(squared[0], full)
+                        S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
+                    if skip_padding:
+                        for row_index in T.serial(half - valid_rows):
+                            row = valid_rows + row_index
+                            for col_tile in T.unroll(chunk // 64, explicit=True):
+                                col = col_tile * 64
+                                ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                                S.vsstb(zero, ptr, nz_stride, full)
+                            S.vsts(squares_ub[row, 0], zero, eight)
+                # Both Vector halves publish their rows to the same Cube L1 tile.
+                T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
+                if not merge or step < jobs // cores - 1:
+                    T.copy(squares_ub, squares[part, vector_m:vector_m + half, 0:8])
+                if chunk == mad_k:
+                    T.copy(a_l1, a_l0)
+                    T.copy(b_l1, b_l0, transpose=True)
+                    T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=True)
+                else:
+                    for mad in T.serial(chunk // mad_k):
+                        offset = mad * mad_k
+                        T.copy(a_l1[:, offset:offset + mad_k], a_l0)
+                        T.copy(b_l1[offset:offset + mad_k, :], b_l0, transpose=True)
+                        T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=mad == 0)
             else:
-                for mad in T.serial(chunk // mad_k):
-                    offset = mad * mad_k
-                    T.copy(a_l1[:, offset:offset + mad_k], a_l0)
-                    T.copy(b_l1[offset:offset + mad_k, :], b_l0, transpose=True)
-                    T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=mad == 0)
+                for local_k in T.Pipelined(k_group, num_stages=1):
+                    k = (part * k_group + local_k) * chunk
+                    # The tail load zero-pads any rows outside the real batch.
+                    T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
+                    T.copy(phi[k:k + chunk, 0:cols], b_l1)
+                    with T.SimdVF():
+                        full = S.pset(32)
+                        first = S.pset(32, "PAT_VL1")
+                        eight = S.pset(32, "PAT_VL8")
+                        zero = S.vdup(T.float32(0), T.float32, full)
+                        nz_stride = T.int32((half + 1) << 16)
+                        valid_rows = T.min(T.max(batch - vector_m, 0), half) if skip_padding else half
+                        for row in T.serial(valid_rows):
+                            squared = S.alloc_local((1,), T.float32)
+                            squared[0] = zero
+                            for col_tile in T.unroll(chunk // 64, explicit=True):
+                                col = col_tile * 64
+                                values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
+                                ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                                S.vsstb(values, ptr, nz_stride, full)
+                                S.vmula(squared[0], values, values, full)
+                            total = S.vcadd(squared[0], full)
+                            S.vsts(local_squares[local_k, row, 0], S.vsel(total, zero, first), eight)
+                        if skip_padding:
+                            for row_index in T.serial(half - valid_rows):
+                                row = valid_rows + row_index
+                                for col_tile in T.unroll(chunk // 64, explicit=True):
+                                    col = col_tile * 64
+                                    ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                                    S.vsstb(zero, ptr, nz_stride, full)
+                                S.vsts(local_squares[local_k, row, 0], zero, eight)
+                    # Both Vector halves publish their rows to the same Cube L1 tile.
+                    T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
+                    T.copy(a_l1, a_l0)
+                    T.copy(b_l1, b_l0, transpose=True)
+                    T.gemm(
+                        a_l0, b_l0, acc, transpose_B=True, clear_accum=local_k == 0,
+                        unit_flag_ctrl=T.Select(local_k == k_group - 1, 3, 2),
+                    )
+                with T.SimtVF(threads=32):
+                    for index in T.Parallel(half * 8):
+                        row = index // 8
+                        lane = index % 8
+                        value = T.alloc_var(T.float32, init=0.0)
+                        for local_k in T.unroll(k_group):
+                            value += local_squares[local_k, row, lane]
+                        squares_ub[row, lane] = value
+                if step < jobs // cores - 1:
+                    T.copy(squares_ub, squares[part, vector_m:vector_m + half, 0:8])
             if merge:
                 # Move the Cube result to Vector so both workspaces are published by MTE3.
-                T.dual_copy(acc, raw_ub)
+                T.dual_copy(acc, raw_ub, unit_flag_ctrl=3 if k_group > 1 else 0)
                 if step < jobs // cores - 1:
                     T.copy(raw_ub, partial[part, vector_m:vector_m + half, 0:cols])
             else:
