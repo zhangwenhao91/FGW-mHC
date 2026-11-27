@@ -1,7 +1,7 @@
 """Forward-only Ascend 950 implementation of TileOPs mHC."""
 
 from functools import lru_cache
-from math import gcd
+from math import gcd, isqrt
 
 import torch
 
@@ -18,10 +18,7 @@ def _check_tensor(name, tensor, shape, dtype, device):
 def _check_input(tensor):
     if tensor.device.type != "npu" or tensor.ndim != 2:
         raise ValueError("Expected a rank-2 Ascend NPU tensor")
-    batch, width = tensor.shape
-    if batch <= 0 or width <= 0 or width % 64:
-        raise ValueError("Expected a positive batch and width divisible by 64")
-    return batch, width
+    return tensor.shape
 
 
 @lru_cache(maxsize=128)
@@ -39,26 +36,38 @@ def mhc_pre(
     phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat,
     sinkhorn_eps=0.02, *, projection="cube", _launch=_run_kernel,
 ):
-    """Return (x_res, x_layer, h_post) for four residual streams.
+    """Return (x_res, x_layer, h_post) for BF16 inputs and FP32 weights.
 
-    Input x is BF16 [B, 4*H]. Phi and bias are FP32 [4*H, 24] and [24].
-    H must be divisible by 64. The default mixed Cube projection uses HF32
-    multiplication with FP32 accumulation. The split and Vector routes are
-    available for performance comparisons.
+    Infer the stream count n from phi's n * (n + 2) columns. Four streams
+    with a hidden size divisible by 64 use the requested TileLang projection;
+    other shapes use the same equations through PyTorch on the NPU.
     """
     batch, width = _check_input(x)
-    if width % 256:
-        raise ValueError("Expected four streams with hidden size divisible by 64")
+    if phi.ndim != 2:
+        raise ValueError("phi must be rank 2")
+    mixes = phi.shape[1]
+    streams = isqrt(mixes + 1) - 1
+    if streams <= 0 or streams * (streams + 2) != mixes:
+        raise ValueError("phi must have n * (n + 2) columns for a positive stream count n")
+    if width <= 0 or width % streams:
+        raise ValueError("x width must be positive and divisible by the stream count")
     if type(sinkhorn_repeat) is not int or sinkhorn_repeat < 0:
         raise ValueError("sinkhorn_repeat must be a nonnegative integer")
-    hidden = width // 4
+    hidden = width // streams
     device = x.device
     _check_tensor("x", x, (batch, width), torch.bfloat16, device)
-    _check_tensor("phi", phi, (width, 24), torch.float32, device)
-    _check_tensor("b", b, (24,), torch.float32, device)
+    _check_tensor("phi", phi, (width, mixes), torch.float32, device)
+    _check_tensor("b", b, (mixes,), torch.float32, device)
 
     if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_split", "vector"):
         raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_full_tail', 'cube_full_k', 'cube_split', or 'vector'")
+    if batch == 0:
+        return torch.empty_like(x), x.new_empty((0, hidden)), b.new_empty((0, streams))
+    if streams != 4 or hidden % 64:
+        from .reference import pre_reference
+
+        return pre_reference(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkhorn_eps)
+
     cube = projection != "vector"
     full_pre = projection in ("cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k")
     merge = full_pre or projection == "cube_mk"
@@ -135,18 +144,30 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
     batch, hidden = _check_input(x_layer_out)
     device = x_layer_out.device
     _check_tensor("x_layer_out", x_layer_out, (batch, hidden), torch.bfloat16, device)
-    _check_tensor("h_post", h_post, (batch, 4), torch.float32, device)
-    _check_tensor("x_res", x_res, (batch, 4 * hidden), torch.bfloat16, device)
+    if h_post.ndim != 2:
+        raise ValueError("h_post must be rank 2")
+    streams = h_post.shape[1]
+    _check_tensor("h_post", h_post, (batch, streams), torch.float32, device)
+    _check_tensor("x_res", x_res, (batch, streams * hidden), torch.bfloat16, device)
 
     if type(num_vec_cores) is not int or not 1 <= num_vec_cores <= 56:
         raise ValueError("num_vec_cores must be an integer from 1 to 56")
     if type(streams_per_task) is not int or streams_per_task not in (1, 2, 4):
         raise ValueError("streams_per_task must be 1, 2, or 4")
-    tile = gcd(hidden, 256)
-    jobs = batch * (4 // streams_per_task) * (hidden // tile)
+    out = torch.empty_like(x_res)
+    if not out.numel():
+        return out
+    group_width = gcd(streams, streams_per_task)
+    token_groups = batch * (streams // group_width)
+    tiles_per_group = max(1, num_vec_cores // token_groups)
+    alignment = 64 * tiles_per_group
+    tile = min(2048, max(256, ((hidden + alignment - 1) // alignment) * 64))
+    jobs = token_groups * ((hidden + tile - 1) // tile)
     cores = min(jobs, num_vec_cores)
     stages = 3 if pipeline and jobs > cores else 0
-    kernel = _compile("post", batch=batch, hidden=hidden, tile=tile, cores=cores, stages=stages, streams=streams_per_task)
-    out = torch.empty_like(x_res)
-    kernel(x_layer_out, h_post, x_res.view(batch, 4, hidden), out.view(batch, 4, hidden))
+    kernel = _compile(
+        "post", batch=batch, hidden=hidden, tile=tile, cores=cores, stages=stages,
+        streams=group_width, total_streams=streams,
+    )
+    kernel(x_layer_out, h_post, x_res.view(batch, streams, hidden), out.view(batch, streams, hidden))
     return out

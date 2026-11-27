@@ -442,13 +442,13 @@ def apply_mix(x, weights, x_res, x_layer, *, batch: int, hidden: int, tile: int)
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
-def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int, cores: int, stages: int, streams: int):
-    tiles = hidden // tile
-    groups = 4 // streams
+def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int, cores: int, stages: int, streams: int, total_streams: int):
+    tiles = (hidden + tile - 1) // tile
+    groups = total_streams // streams
     x_layer: T.Tensor[(batch, hidden), T.bfloat16]
-    h_post: T.Tensor[(batch, 4), T.float32]
-    x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
-    out: T.Tensor[(batch, 4, hidden), T.bfloat16]
+    h_post: T.Tensor[(batch, total_streams), T.float32]
+    x_res: T.Tensor[(batch, total_streams, hidden), T.bfloat16]
+    out: T.Tensor[(batch, total_streams, hidden), T.bfloat16]
 
     with T.Kernel(cores) as core:
         layer_ub = T.alloc_shared((tile,), T.bfloat16)
@@ -465,9 +465,10 @@ def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int, cor
             token = token_group // groups
             stream = token_group % groups * streams
             start = column_tile * tile
-            T.copy(x_layer[token, start], layer_ub)
+            count = T.min(tile, hidden - start)
+            T.copy(x_layer[token, start:start + count], layer_ub[:count])
             T.copy(h_post[token, stream:stream + streams], post_ub[0:streams])
-            T.copy(x_res[token, stream:stream + streams, start:start + tile], res_ub)
+            T.copy(x_res[token, stream:stream + streams, start:start + count], res_ub[:, :count])
             with T.SimdVF():
                 coeff = S.alloc_local((streams,), T.float32)
                 for row in T.unroll(streams, explicit=True):
@@ -479,4 +480,4 @@ def post(x_layer, h_post, x_res, out, *, batch: int, hidden: int, tile: int, cor
                         residual = S.vcvt(S.vld(res_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
                         result = S.vadd(residual, S.vmul(layer, coeff[row]))
                         S.vsts(out_ub[row, col], S.vcvt(result, T.bfloat16), dist="PK_B32")
-            T.copy(out_ub, out[token, stream:stream + streams, start:start + tile], l2_cache_ctrl=0)
+            T.copy(out_ub[:, :count], out[token, stream:stream + streams, start:start + count], l2_cache_ctrl=0)

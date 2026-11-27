@@ -58,3 +58,34 @@ def test_post_streams_and_pipeline(device, batch, hidden, streams_per_task):
         streams_per_task=streams_per_task,
     )
     torch.testing.assert_close(actual.cpu(), expected, atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parametrize("batch,streams,hidden", [(0, 3, 127), (2, 3, 127), (2, 4, 999), (1, 8, 64)])
+def test_pre_general_shapes(device, batch, streams, hidden):
+    x = torch.arange(batch * streams * hidden, dtype=torch.float32).remainder(13)
+    x = x.reshape(batch, streams * hidden).bfloat16()
+    mixes = streams * (streams + 2)
+    phi = torch.zeros((streams * hidden, mixes), dtype=torch.float32, device=device)
+    bias = torch.zeros(mixes, dtype=torch.float32, device=device)
+    residual, layer, post = mhc_pre(phi, x.to(device), bias, 1.0, 1.0, 1.0, 1, 0.0)
+
+    source = x.float().reshape(batch, streams, hidden)
+    mean = source.mean(dim=1, keepdim=True)
+    expected_residual = mean.expand(batch, streams, hidden).reshape_as(x).bfloat16()
+    expected_layer = (source.sum(dim=1) * 0.5).bfloat16()
+    torch.testing.assert_close(residual.cpu(), expected_residual)
+    torch.testing.assert_close(layer.cpu(), expected_layer)
+    torch.testing.assert_close(post.cpu(), torch.ones((batch, streams)))
+
+
+@pytest.mark.parametrize("batch,streams,hidden", [(2, 3, 127), (2, 4, 999), (1, 40, 128), (0, 3, 127), (2, 0, 127), (2, 3, 0)])
+def test_post_general_shapes(device, batch, streams, hidden):
+    rng = torch.Generator().manual_seed(12)
+    layer = torch.randn(batch, hidden, generator=rng).bfloat16()
+    weights = torch.randn(batch, streams, generator=rng)
+    residual = torch.randn(batch, streams * hidden, generator=rng).bfloat16()
+    inputs = (layer.to(device), weights.to(device), residual.to(device))
+    actual = mhc_post(*inputs)
+    torch.testing.assert_close(
+        actual.cpu(), post_reference(layer, weights, residual), atol=0.01, rtol=0.01
+    )
