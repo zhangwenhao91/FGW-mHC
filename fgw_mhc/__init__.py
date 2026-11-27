@@ -65,7 +65,7 @@ def mhc_pre(
     fused = merge or projection == "cube"
     chunk = gcd(width, 256)
     splits = width // chunk
-    tile = gcd(hidden, 256)
+    tile = hidden if full_pre and hidden <= 4096 else gcd(hidden, 256)
     padded_batch = (batch + 15) // 16 * 16
     launch = dict(batch=batch, width=width, chunk=chunk)
     coefficient_config = dict(
@@ -95,7 +95,7 @@ def mhc_pre(
         stage = "pre" if full_pre else "project_and_mix" if merge else "project"
         _launch(
             stage, project, x, phi, partial, squares, partial, squares,
-            b, weights, h_post, weights, x_res.view(batch, 4, hidden), x_layer,
+            b, weights, h_post, x_res.view(batch, 4, hidden), x_layer,
         )
     elif cube:
         prepare = _compile("prepare_cube", **launch)

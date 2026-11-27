@@ -176,7 +176,7 @@ def _compute_weights(
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def project_cube_fused(
-    x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, weights_read, x_res, x_layer, *,
+    x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, x_res, x_layer, *,
     batch: int, width: int, chunk: int, cores: int, merge: bool,
     tile: int = 64, full_pre: bool = False,
     repeat: int = 0, eps: float = 0.02,
@@ -201,7 +201,6 @@ def project_cube_fused(
     h_post: T.Tensor[(batch, 4), T.float32]
 
     hidden = width // 4
-    weights_read: T.Tensor[(batch, 24), T.float32]
     x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
     x_layer: T.Tensor[(batch, hidden), T.bfloat16]
 
@@ -228,7 +227,6 @@ def project_cube_fused(
 
         if full_pre:
             streams_ub = T.alloc_shared((4, tile), T.bfloat16)
-            apply_weights_ub = T.alloc_shared((24,), T.float32)
             res_ub = T.alloc_shared((4, tile), T.bfloat16)
             layer_ub = T.alloc_shared((tile,), T.bfloat16)
             streams = T.reshape(x, (batch, 4, hidden))
@@ -303,37 +301,17 @@ def project_cube_fused(
                         partial_ub, split_squares_ub, bias_ub, totals, weights_ub, post_ub,
                         width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True,
                     )
-                    if not full_pre or step < coefficient_jobs - 1:
+                    if full_pre:
+                        # Keep each token's weights on the Vector half that computed them.
+                        for column_tile in T.serial(hidden // tile):
+                            start = column_tile * tile
+                            T.copy(streams[token, 0, start], streams_ub)
+                            _apply_weights(streams_ub, weights_ub, res_ub, layer_ub, tile)
+                            T.copy(res_ub, x_res[token, 0, start])
+                            T.copy(layer_ub, x_layer[token, start])
+                    else:
                         T.copy(weights_ub, weights[token, 0])
-                        T.copy(post_ub[0:4], h_post[token, 0])
-
-            if full_pre:
-                with T.PerCoreTask():
-                    if coefficient_jobs > 0:
-                        with T.Task():
-                            last_token = first + (coefficient_jobs - 1) * cores * 2
-                            T.copy(weights_ub, weights[last_token, 0])
-                            T.copy(post_ub[0:4], h_post[last_token, 0])
-                    T.ascend_sync_inter_arrive("PIPE_MTE3", 2)
-                    T.ascend_sync_inter_wait("PIPE_MTE3", 2)
-                    _drain_apply = T.call_extern("int32", "FGW_SYNC", T.ascend_pipe_barrier("PIPE_MTE3"))
-                    _ready_apply = T.call_extern("int32", "FGW_SYNC", T.ascend_set_flag("MTE3_MTE2", 6))
-                tiles = hidden // tile
-                with T.Stage(0):
-                    with T.Task():
-                        T.ascend_wait_flag("MTE3_MTE2", 6)
-                        # All participants execute the wait, including idle Vector halves.
-                        T.copy(weights_read[T.min(first // tiles, batch - 1), 0], apply_weights_ub)
-                    for step in T.serial(T.ceildiv(T.max(batch * tiles - first, 0), cores * 2)):
-                        task = first + step * cores * 2
-                        token = task // tiles
-                        start = task % tiles * tile
-                        T.copy(streams[token, 0, start], streams_ub)
-                        if step > 0:
-                            T.copy(weights_read[token, 0], apply_weights_ub)
-                        _apply_weights(streams_ub, apply_weights_ub, res_ub, layer_ub, tile)
-                        T.copy(res_ub, x_res[token, 0, start])
-                        T.copy(layer_ub, x_layer[token, start])
+                    T.copy(post_ub[0:4], h_post[token, 0])
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
