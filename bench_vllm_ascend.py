@@ -16,8 +16,11 @@ def merge_results(tilelang_path, vllm_path, output_path):
     for path, backend in ((tilelang_path, "tilelang"), (vllm_path, "vllm")):
         with path.open(newline="", encoding="utf-8") as source:
             rows = list(csv.DictReader(source))
-        if len(rows) != len(CASES) or any(row["backend"] != backend for row in rows):
-            raise ValueError(f"{path} must contain all {len(CASES)} cases for {backend}")
+        stages = {row.get("stage", "pair") for row in rows}
+        if stages not in ({"pair"}, {"pre", "post"}):
+            raise ValueError(f"{path} must contain either pair timings or separate pre and post timings")
+        if len(rows) != len(CASES) * len(stages) or any(row["backend"] != backend for row in rows):
+            raise ValueError(f"{path} must contain all requested cases for {backend}")
         if backend == "tilelang":
             projections = {"cube_split" if row.get("projection") == "cube" else row.get("projection", "vector")
                            for row in rows}
@@ -26,24 +29,30 @@ def merge_results(tilelang_path, vllm_path, output_path):
             (projection,) = projections
         table = {}
         for row in rows:
-            latency = float(row["pair_us"])
+            stage = row.get("stage", "pair")
+            latency = float(row["pair_us"] if stage == "pair" else row["stage_us"])
             if not math.isfinite(latency) or latency <= 0:
                 raise ValueError(f"Invalid median latency in {path}: {row}")
             key = tuple(int(row[field]) for field in ("batch", "hidden", "sinkhorn_iters", "warmup", "repeat"))
-            table[key] = latency
-        if sorted(key[:2] for key in table) != sorted(CASES):
+            table[(*key, stage)] = latency
+        if sorted((key[:2], key[-1]) for key in table) != sorted((shape, stage) for shape in CASES for stage in stages):
             raise ValueError(f"{path} does not contain the requested benchmark shapes")
         tables.append(table)
 
     tilelang, vllm = tables
     if tilelang.keys() != vllm.keys():
-        raise ValueError("Benchmark shapes, Sinkhorn counts, warmup and repetitions must match")
+        raise ValueError("Benchmark stages, shapes, Sinkhorn counts, warmup and repetitions must match")
     with output_path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
-        writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat",
-                         "tilelang_projection", "tilelang_pair_us", "vllm_ascendc_pair_us", "vllm_over_tilelang_speedup"))
+        split = any(key[-1] != "pair" for key in tilelang)
+        stage_columns = ("stage",) if split else ()
+        metric = "stage" if split else "pair"
+        writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat", *stage_columns,
+                         "tilelang_projection", f"tilelang_{metric}_us", f"vllm_ascendc_{metric}_us",
+                         "vllm_over_tilelang_speedup"))
         for key, latency in tilelang.items():
-            writer.writerow((*key, projection, f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
+            fields = key if split else key[:-1]
+            writer.writerow((*fields, projection, f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
 
 
 def prepare_vllm_opp():
@@ -67,6 +76,7 @@ def main():
     parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k"), default="cube")
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
+    parser.add_argument("--split-stages", action="store_true", help="Measure each backend’s native Pre and Post separately")
     parser.add_argument("--list-cases", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--backend", choices=("both", "tilelang", "vllm"), default="both")
@@ -75,6 +85,8 @@ def main():
     if args.merge:
         merge_results(*args.merge, args.output)
         return
+    if args.split_stages and args.backend == "both":
+        parser.error("--split-stages requires --backend tilelang or --backend vllm")
     if args.list_cases:
         for batch, hidden in CASES:
             print(f"B={batch} n=4 hidden={hidden}")
@@ -113,7 +125,9 @@ def main():
     rng = torch.Generator().manual_seed(42)
     with args.output.open("w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
-        if args.backend != "both":
+        if args.split_stages:
+            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "stage", "stage_us"))
+        elif args.backend != "both":
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "pair_us"))
         else:
             writer.writerow((
@@ -142,6 +156,45 @@ def main():
             def vllm_pair():
                 layer_in, post, comb = vllm_pre(*vllm_args)
                 return layer_in, post, vllm_post(vllm_layer_out, vllm_x, post, comb)
+
+            if args.split_stages:
+                if args.backend == "tilelang":
+                    def pre_op():
+                        return mhc_pre(*pre_args, projection=args.projection)
+
+                    residual, layer_in, post = pre_op()
+                    expected = pre_reference(*pre_args)
+                    torch.testing.assert_close((residual, layer_in, post), expected, atol=0.01, rtol=0.01)
+
+                    def post_op():
+                        return mhc_post(layer_out, post, residual)
+
+                    torch.testing.assert_close(
+                        post_op(), post_reference(layer_out, post, residual), atol=0.01, rtol=0.01,
+                    )
+                else:
+                    def pre_op():
+                        return vllm_pre(*vllm_args)
+
+                    layer_in, post, comb = pre_op()
+
+                    def post_op():
+                        return vllm_post(vllm_layer_out, vllm_x, post, comb)
+
+                    if any(not torch.isfinite(tensor).all().item() for tensor in (layer_in, post, comb, post_op())):
+                        raise RuntimeError(f"Non-finite vLLM AscendC output for B={batch}, hidden={hidden}")
+
+                # The Post inputs stay resident and are prepared before the timed trials.
+                for stage, op in (("pre", pre_op), ("post", post_op)):
+                    latency = time_us(op, torch, args.warmup, args.repeat)
+                    if not math.isfinite(latency) or latency <= 0:
+                        raise RuntimeError(f"Invalid {stage} event time for B={batch}, hidden={hidden}")
+                    projection = projection_label if args.backend == "tilelang" else ""
+                    writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
+                                     args.warmup, args.repeat, projection, stage, f"{latency:.6f}"))
+                    output.flush()
+                    print(f"{args.backend} {stage} B={batch} hidden={hidden}: {latency:.3f} us", flush=True)
+                continue
 
             if args.backend != "vllm":
                 actual = tilelang_pair()
