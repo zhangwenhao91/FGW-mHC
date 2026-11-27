@@ -14,6 +14,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--post-streams", action="store_true", help="Time Post only with 1, 2, or 4 streams per task")
     mode.add_argument("--post-pipeline", action="store_true", help="Compare default, capped, and triple-buffered Post")
+    mode.add_argument("--pre-h-tile", action="store_true", help="Compare cube_full Pre output H tiles at B=4")
     mode.add_argument("--grouped-k", action="store_true", help="Compare 1, 2, and 4 K blocks per Cube group")
     mode.add_argument("--m-only", action="store_true", help="Compare cube_full with M-only Pre")
     mode.add_argument("--split-k", action="store_true", help="Compare cube_full with one split-K job per core")
@@ -34,8 +35,10 @@ def main():
 
     if args.debug_m_only and not args.m_only:
         parser.error("--debug-m-only requires --m-only")
-    if args.pre_only and not (args.m_only or args.grouped_k):
-        parser.error("--pre-only requires --m-only or --grouped-k")
+    if args.pre_h_tile and args.batch != 4:
+        parser.error("--pre-h-tile requires --batch 4")
+    if args.pre_only and not (args.m_only or args.grouped_k or args.pre_h_tile):
+        parser.error("--pre-only requires --m-only, --grouped-k, or --pre-h-tile")
 
     import torch
     import torch_npu  # noqa: F401
@@ -59,7 +62,8 @@ def main():
     phi = phi.to(device)
     bias = bias.to(device)
     layer = layer.to(device, torch.bfloat16)
-    inputs = (phi, x, bias, 1.0, 1.0, 1.0, *((1, 0.02) if args.m_only or args.grouped_k else (20, 1e-6)))
+    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile else (20, 1e-6)
+    inputs = (phi, x, bias, 1.0, 1.0, 1.0, *sinkhorn)
 
     if args.debug_m_only:
         from math import gcd
@@ -88,8 +92,9 @@ def main():
     def run(route):
         if args.post_streams:
             return mhc_post(*post_inputs, streams_per_task=int(route))
-        projection = "cube_full" if args.post_pipeline else route
-        residual, layer_in, post = mhc_pre(*inputs, projection=projection)
+        projection = "cube_full" if args.post_pipeline or args.pre_h_tile else route
+        pre_tile = int(route) if args.pre_h_tile else None
+        residual, layer_in, post = mhc_pre(*inputs, projection=projection, pre_tile=pre_tile)
         if args.pre_only:
             return residual, layer_in, post
         options = {}
@@ -111,6 +116,8 @@ def main():
         routes = ("post_default", "post_capped", "post_triple")
     elif args.simd:
         routes = ("cube_full", "cube_full_simd")
+    elif args.pre_h_tile:
+        routes = ("2560", "1280", "640")
     elif args.grouped_k:
         routes = ("cube_full", "cube_full_g2", "cube_full_g4")
     elif args.m_only:
@@ -137,6 +144,8 @@ def main():
     with open(args.output, "w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
         variant, metric = ("streams_per_task", "post_us") if args.post_streams else ("projection", "pair_us")
+        if args.pre_h_tile:
+            variant = "pre_h_tile"
         if args.pre_only:
             metric = "pre_us"
         writer.writerow(("batch", "hidden", "cycle", "order", "position", variant, metric))

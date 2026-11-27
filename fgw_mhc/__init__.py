@@ -34,7 +34,7 @@ def _run_kernel(name, kernel, *args):
 
 def mhc_pre(
     phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat,
-    sinkhorn_eps=0.02, *, projection="cube", _launch=_run_kernel,
+    sinkhorn_eps=0.02, *, projection="cube", pre_tile=None, _launch=_run_kernel,
 ):
     """Return (x_res, x_layer, h_post) for BF16 inputs and FP32 weights.
 
@@ -62,6 +62,11 @@ def mhc_pre(
     grouped_routes = {"cube_full_g2": 2, "cube_full_g4": 4}
     if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_split", "vector", *grouped_routes):
         raise ValueError(f"Unknown mHC projection {projection!r}")
+    if pre_tile is not None and (
+        projection != "cube_full" or streams != 4 or hidden % 64 or type(pre_tile) is not int
+        or pre_tile <= 0 or pre_tile > 4096 or pre_tile % 64 or hidden % pre_tile
+    ):
+        raise ValueError("pre_tile requires four-stream cube_full and a 64-aligned divisor of H up to 4096")
     if batch == 0:
         return torch.empty_like(x), x.new_empty((0, hidden)), b.new_empty((0, streams))
     if streams != 4 or hidden % 64:
@@ -99,7 +104,7 @@ def mhc_pre(
     if width % (chunk * k_group):
         raise ValueError(f"{projection} requires K divisible by {chunk * k_group}")
     splits = width // (chunk * k_group)
-    tile = hidden if full_pre and hidden <= 4096 else gcd(hidden, 256)
+    tile = pre_tile or (hidden if full_pre and hidden <= 4096 else gcd(hidden, 256))
     padded_batch = (batch + 15) // 16 * 16
     launch = dict(batch=batch, width=width, chunk=chunk)
     coefficient_config = dict(
