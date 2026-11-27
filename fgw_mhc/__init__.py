@@ -85,10 +85,12 @@ def mhc_pre(
     if fused:
         jobs = padded_batch // 16 * splits
         cores = next(candidate for candidate in range(min(jobs, 28), 0, -1) if jobs % candidate == 0)
+        # The SIMD coefficient schedule currently requires one token at most per AIV.
+        simd_weights = projection == "cube_full_simd" and batch <= 2 * cores
         project = _compile(
             "project_cube_fused", **launch, cores=cores, merge=merge,
             **(coefficient_config if merge else {}),
-            **({"full_pre": True, "tile": tile, "simd_weights": projection == "cube_full_simd"} if full_pre else {}),
+            **({"full_pre": True, "tile": tile, "simd_weights": simd_weights} if full_pre else {}),
         )
         squares = torch.empty((splits, padded_batch, 8), device=device, dtype=torch.float32)
         # Read aliases express the workspace publication boundary to the scheduler.
@@ -99,6 +101,8 @@ def mhc_pre(
         )
     elif cube:
         prepare = _compile("prepare_cube", **launch)
+        # The SIMD coefficient schedule currently requires one token at most per AIV.
+        simd_weights = projection == "cube_full_simd" and batch <= 2 * cores
         project = _compile("project_cube", **launch)
         promoted = torch.empty((batch, width), device=device, dtype=torch.float32)
         squares = torch.empty((batch, splits, 8), device=device, dtype=torch.float32)
