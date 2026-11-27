@@ -443,9 +443,12 @@ def project_cube_m_only(
                             S.vsstb(values, ptr, nz_stride, full)
                             S.vmula(squared[0], values, values, full)
                         total = S.vcadd(squared[0], full)
-                        if part > 0:
-                            total = S.vadd(total, S.vld(squares_ub[row, 0], dist="BRC_B32"), first)
-                        S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
+                        if part == 0:
+                            S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
+                        else:
+                            previous = S.vld(squares_ub[row, 0], dist="BRC_B32")
+                            accumulated = S.vadd(total, previous, first)
+                            S.vsts(squares_ub[row, 0], S.vsel(accumulated, zero, first), eight)
                     if valid_rows < half:
                         for row_index in T.serial(half - valid_rows):
                             row = valid_rows + row_index
