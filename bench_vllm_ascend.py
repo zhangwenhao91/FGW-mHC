@@ -100,6 +100,10 @@ def main():
     parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k"), default="cube")
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
+    parser.add_argument("--sweep-pairs", type=int, nargs="+", metavar="PAIRS",
+                        help="Test whole-pair latency with several pair counts per NPU event")
+    parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES],
+                        help="Limit the event batch-size sweep to one workload")
     parser.add_argument("--split-stages", action="store_true", help="Measure each backend’s native Pre and Post separately")
     parser.add_argument("--profile-dir", type=Path, help="Capture consecutive pair launches with the NPU profiler")
     parser.add_argument("--profile-batch", type=int, choices=[batch for batch, _ in CASES])
@@ -111,6 +115,14 @@ def main():
     args = parser.parse_args()
     if args.profile_dir and (args.merge or args.split_stages or args.backend == "both"):
         parser.error("--profile-dir requires one backend and continuous pair execution")
+    if args.sweep_pairs is not None and (
+        args.merge or args.split_stages or args.profile_dir or args.backend == "both"
+    ):
+        parser.error("--sweep-pairs requires a single backend and unprofiled pair execution")
+    if args.sweep_pairs is not None and min(args.sweep_pairs) < 1:
+        parser.error("pair counts must be positive")
+    if args.batch is not None and args.sweep_pairs is None:
+        parser.error("--batch requires --sweep-pairs")
     if args.merge:
         merge_results(*args.merge, args.output)
         return
@@ -157,6 +169,9 @@ def main():
         writer = csv.writer(output)
         if args.profile_dir:
             pass
+        elif args.sweep_pairs:
+            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "projection",
+                             "pairs_per_event", "order", "pair_us"))
         elif args.split_stages:
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "stage", "stage_us"))
         elif args.backend != "both":
@@ -201,6 +216,8 @@ def main():
                     result = vllm_post(vllm_layer_out, vllm_x, post, comb)
                 return layer_in, post, result
 
+            if args.sweep_pairs and args.batch is not None and batch != args.batch:
+                continue
             if args.profile_dir and args.profile_batch is not None and batch != args.profile_batch:
                 continue
 
@@ -256,6 +273,29 @@ def main():
                     raise RuntimeError(f"vLLM AscendC failed for B={batch}, hidden={hidden}: {exc}") from exc
                 if any(not torch.isfinite(tensor).all().item() for tensor in baseline):
                     raise RuntimeError(f"Non-finite vLLM AscendC output for B={batch}, hidden={hidden}")
+
+            if args.sweep_pairs:
+                pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
+                projection = projection_label if args.backend == "tilelang" else ""
+                sizes = tuple(dict.fromkeys(args.sweep_pairs))
+                for order, counts in (("forward", sizes), ("reverse", sizes[::-1])):
+                    for count in counts:
+                        def submit():
+                            result = None
+                            for _ in range(count):
+                                result = pair()
+                            return result
+
+                        elapsed = time_us(pair if count == 1 else submit, torch, args.warmup, args.repeat)
+                        if not math.isfinite(elapsed) or elapsed <= 0:
+                            raise RuntimeError(f"Invalid event time for {count} pairs: {elapsed}")
+                        per_pair = elapsed / count
+                        writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters, projection,
+                                         count, order, f"{per_pair:.6f}"))
+                        output.flush()
+                        print(f"{args.backend} B={batch} H={hidden} {count} pairs/event {order}: "
+                              f"{per_pair:.3f} us/pair", flush=True)
+                continue
 
             if args.profile_dir:
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
