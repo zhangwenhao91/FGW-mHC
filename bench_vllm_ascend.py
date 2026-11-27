@@ -2,8 +2,10 @@
 
 import argparse
 import csv
+from contextlib import nullcontext
 import math
 import os
+import sys
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -68,6 +70,26 @@ def prepare_vllm_opp():
     )
 
 
+def profile_pair(pair, torch, profiler, directory, warmup, steps):
+    for _ in range(warmup):
+        pair()
+    torch.npu.synchronize()
+
+    directory.mkdir(parents=True, exist_ok=True)
+    with profiler.profile(
+        activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+        on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as capture:
+        for step in range(steps):
+            with torch.profiler.record_function(f"mhc_pair_{step:02d}"):
+                pair(trace=True)
+            capture.step()
+        torch.npu.synchronize()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
@@ -77,11 +99,16 @@ def main():
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
     parser.add_argument("--split-stages", action="store_true", help="Measure each backend’s native Pre and Post separately")
+    parser.add_argument("--profile-dir", type=Path, help="Capture consecutive pair launches with the NPU profiler")
+    parser.add_argument("--profile-batch", type=int, choices=[batch for batch, _ in CASES])
+    parser.add_argument("--profile-steps", type=int, default=12)
     parser.add_argument("--list-cases", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--backend", choices=("both", "tilelang", "vllm"), default="both")
     mode.add_argument("--merge", type=Path, nargs=2, metavar=("TILELANG_CSV", "VLLM_CSV"))
     args = parser.parse_args()
+    if args.profile_dir and (args.merge or args.split_stages or args.backend == "both"):
+        parser.error("--profile-dir requires one backend and continuous pair execution")
     if args.merge:
         merge_results(*args.merge, args.output)
         return
@@ -91,8 +118,8 @@ def main():
         for batch, hidden in CASES:
             print(f"B={batch} n=4 hidden={hidden}")
         return
-    if min(args.warmup, args.repeat, args.sinkhorn_iters) < 1:
-        parser.error("warmup, repeat and sinkhorn iterations must be positive")
+    if min(args.warmup, args.repeat, args.sinkhorn_iters, args.profile_steps) < 1:
+        parser.error("warmup, repeat, sinkhorn iterations and profile steps must be positive")
 
     if args.backend != "tilelang":
         try:
@@ -123,9 +150,12 @@ def main():
     projection_label = "cube_fused" if args.projection == "cube" else args.projection
     eps = 1e-6
     rng = torch.Generator().manual_seed(42)
-    with args.output.open("w", encoding="utf-8", newline="") as output:
+    output_context = nullcontext(sys.stdout) if args.profile_dir else args.output.open("w", encoding="utf-8", newline="")
+    with output_context as output:
         writer = csv.writer(output)
-        if args.split_stages:
+        if args.profile_dir:
+            pass
+        elif args.split_stages:
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "stage", "stage_us"))
         elif args.backend != "both":
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "pair_us"))
@@ -149,13 +179,28 @@ def main():
             pre_args = (phi, x, bias, 1.0, 1.0, 1.0, args.sinkhorn_iters, eps)
             vllm_args = (vllm_x, vllm_phi, scale, bias, 4, args.sinkhorn_iters, eps, eps)
 
-            def tilelang_pair():
-                residual, layer_in, post = mhc_pre(*pre_args, projection=args.projection)
-                return layer_in, post, mhc_post(layer_out, post, residual)
+            def tilelang_pair(trace=False):
+                if not trace:
+                    residual, layer_in, post = mhc_pre(*pre_args, projection=args.projection)
+                    return layer_in, post, mhc_post(layer_out, post, residual)
+                with torch.profiler.record_function("fgw_pre"):
+                    residual, layer_in, post = mhc_pre(*pre_args, projection=args.projection)
+                with torch.profiler.record_function("fgw_post"):
+                    result = mhc_post(layer_out, post, residual)
+                return layer_in, post, result
 
-            def vllm_pair():
-                layer_in, post, comb = vllm_pre(*vllm_args)
-                return layer_in, post, vllm_post(vllm_layer_out, vllm_x, post, comb)
+            def vllm_pair(trace=False):
+                if not trace:
+                    layer_in, post, comb = vllm_pre(*vllm_args)
+                    return layer_in, post, vllm_post(vllm_layer_out, vllm_x, post, comb)
+                with torch.profiler.record_function("vllm_pre"):
+                    layer_in, post, comb = vllm_pre(*vllm_args)
+                with torch.profiler.record_function("vllm_post"):
+                    result = vllm_post(vllm_layer_out, vllm_x, post, comb)
+                return layer_in, post, result
+
+            if args.profile_dir and args.profile_batch is not None and batch != args.profile_batch:
+                continue
 
             if args.split_stages:
                 if args.backend == "tilelang":
@@ -209,6 +254,13 @@ def main():
                     raise RuntimeError(f"vLLM AscendC failed for B={batch}, hidden={hidden}: {exc}") from exc
                 if any(not torch.isfinite(tensor).all().item() for tensor in baseline):
                     raise RuntimeError(f"Non-finite vLLM AscendC output for B={batch}, hidden={hidden}")
+
+            if args.profile_dir:
+                pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
+                directory = args.profile_dir / args.backend / f"b{batch}-h{hidden}"
+                profile_pair(pair, torch, torch_npu.profiler, directory, args.warmup, args.profile_steps)
+                print(f"Trace for {args.backend} B={batch} H={hidden}: {directory}", flush=True)
+                continue
 
             if args.backend != "both":
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
