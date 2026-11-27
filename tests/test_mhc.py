@@ -16,7 +16,7 @@ def device():
 
 
 @pytest.mark.parametrize("batch,hidden,repeat", [(1, 1280, 1), (2, 1920, 1), (4, 2560, 1), (3, 64, 20)])
-@pytest.mark.parametrize("projection", ["vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd"])
+@pytest.mark.parametrize("projection", ["vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail"])
 def test_pre_post(device, batch, hidden, repeat, projection):
     rng = torch.Generator().manual_seed(42)
     x = torch.randn(batch, 4 * hidden, generator=rng).bfloat16()

@@ -217,7 +217,7 @@ def _compute_weights(
 def project_cube_fused(
     x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, x_res, x_layer, *,
     batch: int, width: int, chunk: int, cores: int, merge: bool,
-    tile: int = 64, full_pre: bool = False, simd_weights: bool = False,
+    tile: int = 64, full_pre: bool = False, simd_weights: bool = False, skip_padding: bool = False,
     repeat: int = 0, eps: float = 0.02,
     alpha_pre: float = 1.0, alpha_post: float = 1.0, alpha_res: float = 1.0,
 ):
@@ -288,7 +288,8 @@ def project_cube_fused(
                 eight = S.pset(32, "PAT_VL8")
                 zero = S.vdup(T.float32(0), T.float32, full)
                 nz_stride = T.int32((half + 1) << 16)
-                for row in T.serial(half):
+                valid_rows = T.min(T.max(batch - vector_m, 0), half) if skip_padding else half
+                for row in T.serial(valid_rows):
                     squared = S.alloc_local((1,), T.float32)
                     squared[0] = zero
                     for col_tile in T.unroll(chunk // 64, explicit=True):
@@ -299,6 +300,14 @@ def project_cube_fused(
                         S.vmula(squared[0], values, values, full)
                     total = S.vcadd(squared[0], full)
                     S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
+                if skip_padding:
+                    for row_index in T.Serial(T.Cast("uint16", valid_rows), T.uint16(half)):
+                        row = T.Cast("int32", row_index)
+                        for col_tile in T.unroll(chunk // 64, explicit=True):
+                            col = col_tile * 64
+                            ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                            S.vsstb(zero, ptr, nz_stride, full)
+                        S.vsts(squares_ub[row, 0], zero, eight)
             # Both Vector halves publish their rows to the same Cube L1 tile.
             T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
             if not merge or step < jobs // cores - 1:

@@ -57,10 +57,10 @@ def mhc_pre(
     _check_tensor("phi", phi, (width, 24), torch.float32, device)
     _check_tensor("b", b, (24,), torch.float32, device)
 
-    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_split", "vector"):
-        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_split', or 'vector'")
+    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_split", "vector"):
+        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_full_tail', 'cube_split', or 'vector'")
     cube = projection != "vector"
-    full_pre = projection in ("cube_full", "cube_full_simd")
+    full_pre = projection in ("cube_full", "cube_full_simd", "cube_full_tail")
     merge = full_pre or projection == "cube_mk"
     fused = merge or projection == "cube"
     chunk = gcd(width, 256)
@@ -90,7 +90,8 @@ def mhc_pre(
         project = _compile(
             "project_cube_fused", **launch, cores=cores, merge=merge,
             **(coefficient_config if merge else {}),
-            **({"full_pre": True, "tile": tile, "simd_weights": simd_weights} if full_pre else {}),
+            full_pre=full_pre, tile=tile if full_pre else 64, simd_weights=simd_weights,
+            skip_padding=projection == "cube_full_tail",
         )
         squares = torch.empty((splits, padded_batch, 8), device=device, dtype=torch.float32)
         # Read aliases express the workspace publication boundary to the scheduler.
@@ -101,8 +102,6 @@ def mhc_pre(
         )
     elif cube:
         prepare = _compile("prepare_cube", **launch)
-        # The SIMD coefficient schedule currently requires one token at most per AIV.
-        simd_weights = projection == "cube_full_simd" and batch <= 2 * cores
         project = _compile("project_cube", **launch)
         promoted = torch.empty((batch, width), device=device, dtype=torch.float32)
         squares = torch.empty((batch, splits, 8), device=device, dtype=torch.float32)

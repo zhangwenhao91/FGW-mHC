@@ -1,4 +1,4 @@
-"""Retest B=2 pair latency with all execution orders on one NPU."""
+"""Retest Cube pair latency with all execution orders on one NPU."""
 import argparse
 import csv
 from itertools import permutations
@@ -11,7 +11,10 @@ ROUTES = ("cube", "cube_mk", "cube_full")
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--tail", action="store_true", help="Compare cube_full with valid-row preparation")
+    mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
+    parser.add_argument("--batch", type=int, choices=tuple(batch for batch, _ in CASES), default=2)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--cycles", type=int, default=2, help="Repeats of all route orders")
     parser.add_argument("--warmup", type=int, default=30)
@@ -37,7 +40,7 @@ def main():
         phi = torch.randn(width, 24, generator=rng) / width**0.5
         bias = torch.randn(24, generator=rng)
         layer = torch.randn(batch, hidden, generator=rng)
-        if batch == 2:
+        if batch == args.batch:
             break
     x = x.to(device, torch.bfloat16)
     phi = phi.to(device)
@@ -51,7 +54,11 @@ def main():
 
     residual, layer_in, post = pre_reference(*inputs)
     expected = (residual, layer_in, post, post_reference(layer, post, residual))
-    routes = ("cube_full", "cube_full_simd") if args.simd else ROUTES
+    routes = ROUTES
+    if args.simd:
+        routes = ("cube_full", "cube_full_simd")
+    elif args.tail:
+        routes = ("cube_full", "cube_full_tail")
     for route in routes:
         torch.testing.assert_close(run(route), expected, atol=0.01, rtol=0.01)
     torch.npu.synchronize()
