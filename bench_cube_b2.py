@@ -94,7 +94,16 @@ def main():
     elif args.tail:
         routes = ("cube_full", "cube_full_tail")
     for route in routes:
-        torch.testing.assert_close(run(route), expected, atol=0.01, rtol=0.01)
+        actual = run(route)
+        names = ("post",) if args.post_streams else ("x_res", "x_layer", "h_post", "pair")
+        for name, value, reference in zip(
+            names, (actual,) if args.post_streams else actual,
+            (expected,) if args.post_streams else expected,
+        ):
+            try:
+                torch.testing.assert_close(value, reference, atol=0.01, rtol=0.01)
+            except AssertionError as exc:
+                raise AssertionError(f"{route}, B={batch}, H={hidden}, {name}: {exc}") from exc
     torch.npu.synchronize()
 
     medians = {route: [] for route in routes}

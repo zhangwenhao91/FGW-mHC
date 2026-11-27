@@ -461,8 +461,12 @@ def project_cube_m_only(
                 T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
                 T.copy(a_l1, a_l0)
                 T.copy(b_l1, b_l0, transpose=True)
-                T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=part == 0)
-            T.dual_copy(acc, raw_ub)
+                # Keep L0C live through intermediate MADs and release it for the final Fixpipe copy.
+                T.gemm(
+                    a_l0, b_l0, acc, transpose_B=True, clear_accum=part == 0,
+                    unit_flag_ctrl=T.Select(part == splits - 1, 3, 2),
+                )
+            T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
             for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
                 token = vector_m + row
