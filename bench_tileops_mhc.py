@@ -48,6 +48,8 @@ def main():
     sys.path.insert(0, str(source))
     import torch
     import torch_npu  # noqa: F401
+    # A source checkout has no installed backend entry-point metadata.
+    import tileops.ascend  # noqa: F401
     from tileops.sequence_modeling import MHCPostFwdOp, MHCPreFwdOp
 
     from fgw_mhc import mhc_post, mhc_pre
