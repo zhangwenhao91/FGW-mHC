@@ -78,6 +78,7 @@ def profile_pair(pair, torch, profiler, directory, warmup, steps):
     directory.mkdir(parents=True, exist_ok=True)
     with profiler.profile(
         activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+        schedule=profiler.schedule(wait=0, warmup=0, active=steps, repeat=1),
         on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
         record_shapes=False,
         profile_memory=False,
@@ -86,8 +87,9 @@ def profile_pair(pair, torch, profiler, directory, warmup, steps):
         for step in range(steps):
             with torch.profiler.record_function(f"mhc_pair_{step:02d}"):
                 pair(trace=True)
+            if step == steps - 1:
+                torch.npu.synchronize()
             capture.step()
-        torch.npu.synchronize()
 
 
 def main():
@@ -258,7 +260,22 @@ def main():
             if args.profile_dir:
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
                 directory = args.profile_dir / args.backend / f"b{batch}-h{hidden}"
-                profile_pair(pair, torch, torch_npu.profiler, directory, args.warmup, args.profile_steps)
+                directory.mkdir(parents=True, exist_ok=True)
+                timings = directory / "unprofiled-pair.csv"
+                with timings.open("w", encoding="utf-8", newline="") as summary:
+                    timing_writer = csv.writer(summary)
+                    timing_writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters",
+                                            "warmup", "repeat", "phase", "pair_us"))
+                    for phase in ("before", "after"):
+                        if phase == "after":
+                            profile_pair(pair, torch, torch_npu.profiler, directory, args.warmup, args.profile_steps)
+                        latency = time_us(pair, torch, args.warmup, args.repeat)
+                        if not math.isfinite(latency) or latency <= 0:
+                            raise RuntimeError(f"Invalid unprofiled pair time for B={batch}, H={hidden}: {latency}")
+                        timing_writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
+                                                args.warmup, args.repeat, phase, f"{latency:.6f}"))
+                        summary.flush()
+                        print(f"{args.backend} B={batch} H={hidden} {phase} trace: {latency:.3f} us", flush=True)
                 print(f"Trace for {args.backend} B={batch} H={hidden}: {directory}", flush=True)
                 continue
 
