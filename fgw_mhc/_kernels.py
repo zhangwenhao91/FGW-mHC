@@ -229,20 +229,29 @@ def project_cube_fused(
                     S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
             # Both Vector halves publish their rows to the same Cube L1 tile.
             T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
-            T.copy(squares_ub, squares[part, vector_m:vector_m + half, 0:8])
+            if not merge or step < jobs // cores - 1:
+                T.copy(squares_ub, squares[part, vector_m:vector_m + half, 0:8])
             T.copy(a_l1, a_l0)
             T.copy(b_l1, b_l0, transpose=True)
             T.gemm(a_l0, b_l0, acc, transpose_B=True, clear_accum=True)
             if merge:
                 # Move the Cube result to Vector so both workspaces are published by MTE3.
                 T.dual_copy(acc, raw_ub)
-                T.copy(raw_ub, partial[part, vector_m:vector_m + half, 0:cols])
+                if step < jobs // cores - 1:
+                    T.copy(raw_ub, partial[part, vector_m:vector_m + half, 0:cols])
             else:
                 T.copy(acc, partial[part, m:m + rows, 0:cols])
 
         if merge:
             # Every Vector half participates, including halves with no coefficient work.
+            last_job = (jobs // cores - 1) * cores + core
+            last_part = last_job // row_tiles
+            last_row = last_job % row_tiles * rows + side * half
             with T.PerCoreTask():
+                # Anchor publication to the final workspace stores.
+                with T.Task():
+                    T.copy(raw_ub, partial[last_part, last_row:last_row + half, 0:cols])
+                    T.copy(squares_ub, squares[last_part, last_row:last_row + half, 0:8])
                 T.ascend_sync_inter_arrive("PIPE_MTE3", 1)
                 T.ascend_sync_inter_wait("PIPE_MTE3", 1)
                 _drain = T.call_extern("int32", "FGW_SYNC", T.ascend_pipe_barrier("PIPE_MTE3"))
