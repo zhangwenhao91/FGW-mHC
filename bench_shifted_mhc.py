@@ -34,24 +34,22 @@ def merge_results(fgw_path, vllm_path, output_path):
             raise ValueError(f"{path}: expected {backend} timings")
         table = {}
         for row in rows:
-            key = tuple(row[field] for field in ("stage", "tokens", "hidden", "warmup", "repeat"))
+            key = tuple(row[field] for field in ("stage", "scope", "tokens", "hidden", "warmup", "repeat"))
             latency = float(row["latency_us"])
             if key in table or not isfinite(latency) or latency <= 0:
                 raise ValueError(f"{path}: duplicate or invalid sample {row}")
             table[key] = latency
         tables.append(table)
     fgw, vllm = tables
-    if not vllm or set(vllm) != {key for key in fgw if key[0] == "post"}:
-        raise ValueError("FGW and vLLM Post shape and timing settings must match")
+    if not vllm or set(vllm) != set(fgw):
+        raise ValueError("FGW and vLLM stages, scopes, shapes and timing settings must match")
     with output_path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
-        writer.writerow(("stage", "tokens", "hidden", "warmup", "repeat",
+        writer.writerow(("stage", "scope", "tokens", "hidden", "warmup", "repeat",
                          "fgw_us", "vllm_ascendc_us", "speedup"))
         for key, elapsed in fgw.items():
-            baseline = vllm.get(key)
-            writer.writerow((*key, f"{elapsed:.3f}",
-                             "" if baseline is None else f"{baseline:.3f}",
-                             "" if baseline is None else f"{baseline / elapsed:.3f}"))
+            baseline = vllm[key]
+            writer.writerow((*key, f"{elapsed:.3f}", f"{baseline:.3f}", f"{baseline / elapsed:.3f}"))
 
 
 def main():
@@ -84,6 +82,7 @@ def main():
         bootstrap_custom_op_env()
         import vllm_ascend.vllm_ascend_C  # noqa: F401
 
+        vllm_pre = torch.ops._C_ascend.npu_hc_pre_v3
         vllm_post = torch.ops._C_ascend.npu_hc_post
 
     device = torch.device(args.device)
@@ -92,14 +91,15 @@ def main():
 
     with args.output.open("w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
-        writer.writerow(("backend", "stage", "tokens", "hidden", "warmup", "repeat", "latency_us"))
+        writer.writerow(("backend", "stage", "scope", "tokens", "hidden", "warmup", "repeat", "latency_us"))
 
         def measure(stage, op, reference):
             torch.testing.assert_close(op(), reference(), atol=0.01, rtol=0.01)
             latency = time_us(op, torch, args.warmup, args.repeat)
             if not isfinite(latency) or latency <= 0:
                 raise RuntimeError(f"Invalid event time: {latency}")
-            writer.writerow((args.backend, stage, tokens, hidden, args.warmup, args.repeat, f"{latency:.6f}"))
+            scope = "projection_included" if stage == "pre" else "full_residual_mix"
+            writer.writerow((args.backend, stage, scope, tokens, hidden, args.warmup, args.repeat, f"{latency:.6f}"))
             output.flush()
             print(f"{args.backend} {stage} N={tokens} H={hidden}: {latency:.3f} us", flush=True)
 
@@ -117,40 +117,50 @@ def main():
                 # Binary-exact, asymmetric coefficients exercise the orientation on both stacks.
                 comb_mix = rand(tokens, 4, 4).sign() * 0.25
 
-                if args.backend == "tilelang":
-                    # Generate Pre-only operands with a separate seed so both Post paths see identical inputs.
-                    pre_rng = torch.Generator().manual_seed(42 + tokens + hidden)
+                pre_rng = torch.Generator().manual_seed(42 + tokens + hidden)
 
-                    def pre_rand(*shape):
-                        return torch.randn(shape, generator=pre_rng).to(device)
+                def pre_rand(*shape):
+                    return torch.randn(shape, generator=pre_rng).to(device)
 
+                hc_fn = pre_rand(24, 4 * hidden) / (4 * hidden)**0.5
+                scale, bias = pre_rand(3), pre_rand(24)
+                previous = pre_rand(tokens, 4).sigmoid()
+
+                def project():
                     flat = x.float().flatten(1)
-                    phi = pre_rand(4 * hidden, 24) / (4 * hidden)**0.5
-                    projection = (flat @ phi).unsqueeze(0)
-                    squares = flat.square().sum(-1).unsqueeze(0)
-                    del flat, phi
-                    scale, bias = pre_rand(3), pre_rand(24)
-                    previous = pre_rand(tokens, 4).sigmoid()
-                    inputs = (x, projection, squares, scale, bias, previous)
-                    layer = x.new_empty((tokens, hidden))
-                    next_pre = scale.new_empty((tokens, 4, 1))
-                    post = torch.empty_like(next_pre)
-                    comb = scale.new_empty((tokens, 4, 4))
+                    return (flat @ hc_fn.T).unsqueeze(0), flat.square().sum(-1).unsqueeze(0)
 
+                def reference_pre():
+                    return pre_ref(x, *project(), scale, bias, previous)
+
+                if args.backend == "tilelang":
                     def run_pre():
-                        pre_kernel(*inputs, layer, next_pre, post, comb)
+                        projection, squares = project()
+                        layer = x.new_empty((tokens, hidden))
+                        next_pre = scale.new_empty((tokens, 4, 1))
+                        post = torch.empty_like(next_pre)
+                        comb = scale.new_empty((tokens, 4, 4))
+                        pre_kernel(x, projection, squares, scale, bias, previous, layer, next_pre, post, comb)
                         return layer, next_pre, post, comb
 
-                    measure("pre", run_pre, lambda: pre_ref(*inputs))
                     def run_post():
                         out = torch.empty_like(x)
                         post_kernel(layer_out, x, post_mix, comb_mix, out)
                         return out
                 else:
-                    vllm_inputs = tuple(t.unsqueeze(0) for t in (layer_out, x, post_mix, comb_mix))
+                    vllm_pre_inputs = (x.unsqueeze(0), hc_fn, scale, bias, previous.unsqueeze(0),
+                                       4, 20, 1e-20, 1e-6)
+                    vllm_post_inputs = tuple(t.unsqueeze(0) for t in (layer_out, x, post_mix, comb_mix))
+
+                    def run_pre():
+                        layer, post, comb, next_pre = vllm_pre(*vllm_pre_inputs)
+                        return (layer.reshape(tokens, hidden), next_pre.reshape(tokens, 4, 1),
+                                post.reshape(tokens, 4, 1), comb.reshape(tokens, 4, 4))
 
                     def run_post():
-                        return vllm_post(*vllm_inputs).squeeze(0)
+                        return vllm_post(*vllm_post_inputs).squeeze(0)
+
+                measure("pre", run_pre, reference_pre)
 
                 def post_ref():
                     return (layer_out.float().unsqueeze(1) * post_mix.unsqueeze(-1)
