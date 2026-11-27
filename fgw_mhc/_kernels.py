@@ -301,8 +301,8 @@ def project_cube_fused(
                     total = S.vcadd(squared[0], full)
                     S.vsts(squares_ub[row, 0], S.vsel(total, zero, first), eight)
                 if skip_padding:
-                    for row_index in T.Serial(T.Cast("uint16", valid_rows), T.uint16(half)):
-                        row = T.Cast("int32", row_index)
+                    for row_index in T.serial(half - valid_rows):
+                        row = valid_rows + row_index
                         for col_tile in T.unroll(chunk // 64, explicit=True):
                             col = col_tile * 64
                             ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
