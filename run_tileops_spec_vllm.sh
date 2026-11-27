@@ -4,6 +4,11 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 card="${1:-4}"
+case "${2:-all}" in
+    all) modes=(stages pair); projection=cube_full; label=tileops-spec ;;
+    tuned-pair) modes=(pair); projection=tileops_tuned; label=tileops-spec-tuned ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair]" >&2; exit 2 ;;
+esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
 for node in /dev/davinci[0-9]* /dev/hisi_hdc /dev/ummu /dev/uburma; do
@@ -12,14 +17,14 @@ for node in /dev/davinci[0-9]* /dev/hisi_hdc /dev/ummu /dev/uburma; do
     fi
 done
 
-for mode in stages pair; do
+for mode in "${modes[@]}"; do
     stage_args=()
     if [[ "$mode" == stages ]]; then
         stage_args=(--split-stages)
     fi
-    prefix="tileops-spec-$mode-card$card"
+    prefix="$label-$mode-card$card"
     common=(--tileops-spec --device npu:0 "${stage_args[@]}")
-    python bench_vllm_ascend.py --backend tilelang --projection cube_full \
+    python bench_vllm_ascend.py --backend tilelang --projection "$projection" \
         "${common[@]}" --output "$prefix-tilelang.csv"
     docker run --rm --pull=never --shm-size=1g "${devices[@]}" \
         -e ASCEND_RT_VISIBLE_DEVICES \

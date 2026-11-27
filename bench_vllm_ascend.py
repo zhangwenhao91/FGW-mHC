@@ -14,7 +14,7 @@ from bench_mhc import CASES, time_us
 
 def merge_results(tilelang_path, vllm_path, output_path):
     tables = []
-    projection = "vector"
+    projections = {}
     for path, backend in ((tilelang_path, "tilelang"), (vllm_path, "vllm")):
         with path.open(newline="", encoding="utf-8") as source:
             rows = list(csv.DictReader(source))
@@ -23,12 +23,6 @@ def merge_results(tilelang_path, vllm_path, output_path):
             raise ValueError(f"{path} must contain either pair timings or separate pre and post timings")
         if len(rows) != len(CASES) * len(stages) or any(row["backend"] != backend for row in rows):
             raise ValueError(f"{path} must contain all requested cases for {backend}")
-        if backend == "tilelang":
-            projections = {"cube_split" if row.get("projection") == "cube" else row.get("projection", "vector")
-                           for row in rows}
-            if len(projections) != 1:
-                raise ValueError(f"{path} mixes TileLang projection modes")
-            (projection,) = projections
         table = {}
         for row in rows:
             stage = row.get("stage", "pair")
@@ -36,7 +30,11 @@ def merge_results(tilelang_path, vllm_path, output_path):
             if not math.isfinite(latency) or latency <= 0:
                 raise ValueError(f"Invalid median latency in {path}: {row}")
             key = tuple(int(row[field]) for field in ("batch", "hidden", "sinkhorn_iters", "warmup", "repeat"))
-            table[(*key, float(row.get("sinkhorn_eps", 1e-6)), stage)] = latency
+            key = (*key, float(row.get("sinkhorn_eps", 1e-6)), stage)
+            table[key] = latency
+            if backend == "tilelang":
+                route = row.get("projection", "vector")
+                projections[key] = "cube_split" if route == "cube" else route
         if sorted((key[:2], key[-1]) for key in table) != sorted((shape, stage) for shape in CASES for stage in stages):
             raise ValueError(f"{path} does not contain the requested benchmark shapes")
         tables.append(table)
@@ -54,7 +52,7 @@ def merge_results(tilelang_path, vllm_path, output_path):
                          "vllm_over_tilelang_speedup"))
         for key, latency in tilelang.items():
             fields = key if split else key[:-1]
-            writer.writerow((*fields, projection, f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
+            writer.writerow((*fields, projections[key], f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
 
 
 def prepare_vllm_opp():
@@ -97,7 +95,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--repeat", type=int, default=100)
-    parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k"), default="cube")
+    parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "tileops_tuned"), default="cube")
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
     parser.add_argument("--sweep-pairs", type=int, nargs="+", metavar="PAIRS",
@@ -166,7 +164,6 @@ def main():
             parser.exit(1, f"Could not load vLLM Ascend A5 HcPre/HcPost custom ops: {exc}\n")
 
     torch.npu.set_device(device)
-    projection_label = "cube_fused" if args.projection == "cube" else args.projection
     eps = 0.02 if args.tileops_spec else 1e-6
     rng = torch.Generator().manual_seed(42)
     output_context = nullcontext(sys.stdout) if args.profile_dir else args.output.open("w", encoding="utf-8", newline="")
@@ -189,6 +186,10 @@ def main():
             ))
         output.flush()
         for batch, hidden in CASES:
+            route = args.projection
+            if route == "tileops_tuned":
+                route = "cube_m_only" if (batch, hidden) in ((1, 1280), (2, 1920)) else "cube_full"
+            projection_label = "cube_fused" if route == "cube" else route
             width = 4 * hidden
             x = torch.randn(batch, width, generator=rng).to(device, torch.bfloat16)
             phi = (torch.randn(width, 24, generator=rng) / math.sqrt(width)).to(device)
@@ -203,10 +204,10 @@ def main():
 
             def tilelang_pair(trace=False):
                 if not trace:
-                    residual, layer_in, post = mhc_pre(*pre_args, projection=args.projection)
+                    residual, layer_in, post = mhc_pre(*pre_args, projection=route)
                     return layer_in, post, mhc_post(layer_out, post, residual)
                 with torch.profiler.record_function("fgw_pre"):
-                    residual, layer_in, post = mhc_pre(*pre_args, projection=args.projection)
+                    residual, layer_in, post = mhc_pre(*pre_args, projection=route)
                 with torch.profiler.record_function("fgw_post"):
                     result = mhc_post(layer_out, post, residual)
                 return layer_in, post, result
@@ -229,7 +230,7 @@ def main():
             if args.split_stages:
                 if args.backend == "tilelang":
                     def pre_op():
-                        return mhc_pre(*pre_args, projection=args.projection)
+                        return mhc_pre(*pre_args, projection=route)
 
                     residual, layer_in, post = pre_op()
                     expected = pre_reference(*pre_args)
