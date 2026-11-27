@@ -11,8 +11,9 @@ ROUTES = ("cube", "cube_mk", "cube_full")
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--cycles", type=int, default=2, help="Repeats of all six route orders")
+    parser.add_argument("--cycles", type=int, default=2, help="Repeats of all route orders")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-b2-orders.csv")
@@ -50,17 +51,18 @@ def main():
 
     residual, layer_in, post = pre_reference(*inputs)
     expected = (residual, layer_in, post, post_reference(layer, post, residual))
-    for route in ROUTES:
+    routes = ("cube_full", "cube_full_simd") if args.simd else ROUTES
+    for route in routes:
         torch.testing.assert_close(run(route), expected, atol=0.01, rtol=0.01)
     torch.npu.synchronize()
 
-    medians = {route: [] for route in ROUTES}
-    positions = {route: [[], [], []] for route in ROUTES}
+    medians = {route: [] for route in routes}
+    positions = {route: [[] for _ in routes] for route in routes}
     with open(args.output, "w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
         writer.writerow(("batch", "hidden", "cycle", "order", "position", "projection", "pair_us"))
         for cycle in range(1, args.cycles + 1):
-            for order in permutations(ROUTES):
+            for order in permutations(routes):
                 order_label = "/".join(order)
                 for position, route in enumerate(order, start=1):
                     latency = time_us(lambda: run(route), torch, args.warmup, args.repeat)

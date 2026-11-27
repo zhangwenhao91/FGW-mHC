@@ -57,10 +57,10 @@ def mhc_pre(
     _check_tensor("phi", phi, (width, 24), torch.float32, device)
     _check_tensor("b", b, (24,), torch.float32, device)
 
-    if projection not in ("cube", "cube_mk", "cube_full", "cube_split", "vector"):
-        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_split', or 'vector'")
+    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd", "cube_split", "vector"):
+        raise ValueError("projection must be 'cube', 'cube_mk', 'cube_full', 'cube_full_simd', 'cube_split', or 'vector'")
     cube = projection != "vector"
-    full_pre = projection == "cube_full"
+    full_pre = projection in ("cube_full", "cube_full_simd")
     merge = full_pre or projection == "cube_mk"
     fused = merge or projection == "cube"
     chunk = gcd(width, 256)
@@ -88,7 +88,7 @@ def mhc_pre(
         project = _compile(
             "project_cube_fused", **launch, cores=cores, merge=merge,
             **(coefficient_config if merge else {}),
-            **({"full_pre": True, "tile": tile} if full_pre else {}),
+            **({"full_pre": True, "tile": tile, "simd_weights": projection == "cube_full_simd"} if full_pre else {}),
         )
         squares = torch.empty((splits, padded_batch, 8), device=device, dtype=torch.float32)
         # Read aliases express the workspace publication boundary to the scheduler.

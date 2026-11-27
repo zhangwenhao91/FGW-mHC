@@ -117,9 +117,44 @@ def _apply_weights(x_ub, weights_ub, res_ub, layer_ub, tile):
 
 
 @T.macro
+def _normalize_simd(totals, bias_ub, weights_ub, post_ub, width, repeat, eps, alpha_pre, alpha_post, alpha_res):
+    with T.SimdVF():
+        four = S.pset(32, "PAT_VL4")
+        one = S.vdup(T.float32(1), T.float32, four)
+        two = S.vdup(T.float32(2), T.float32, four)
+        epsilon = S.vdup(T.float32(eps), T.float32, four)
+        sum_sq = S.vld(totals[24], dist="BRC_B32")
+        norm = S.vadds(S.vsqrt(S.vmuls(sum_sq, 1.0 / width, four), four), 0.0001, four)
+
+        pre = S.vadd(S.vdiv(S.vmuls(S.vld(totals[0]), alpha_pre, four), norm, four), S.vld(bias_ub[0]), four)
+        post = S.vadd(S.vdiv(S.vmuls(S.vld(totals[4]), alpha_post, four), norm, four), S.vld(bias_ub[4]), four)
+        S.vsts(weights_ub[0], S.vdiv(one, S.vadd(one, S.vexp(S.vneg(pre, four), four), four), four), four)
+        S.vsts(post_ub[0], S.vdiv(two, S.vadd(one, S.vexp(S.vneg(post, four), four), four), four), four)
+
+        rows = S.alloc_local((4,), T.float32)
+        for row in T.unroll(4, explicit=True):
+            q = 8 + row * 4
+            projected = S.vdiv(S.vmuls(S.vld(totals[q]), alpha_res, four), norm, four)
+            logits = S.vadd(projected, S.vld(bias_ub[q]), four)
+            row_max = S.vdupv(S.vcmax(logits, four), four)
+            rows[row] = S.vexp(S.vsub(logits, row_max, four), four)
+        for iteration in T.serial(repeat):
+            for row in T.unroll(4, explicit=True):
+                row_sum = S.vdupv(S.vcadd(rows[row], four), four)
+                rows[row] = S.vdiv(rows[row], S.vadd(row_sum, epsilon, four), four)
+            cols = S.vadd(S.vadd(S.vadd(rows[0], rows[1], four), rows[2], four), rows[3], four)
+            denom = S.vadd(cols, epsilon, four)
+            for row in T.unroll(4, explicit=True):
+                rows[row] = S.vdiv(rows[row], denom, four)
+        for row in T.unroll(4, explicit=True):
+            S.vsts(weights_ub[4 + row * 4], rows[row], four)
+        S.vsts(weights_ub[20], S.vdup(T.float32(0), T.float32, four), four)
+
+
+@T.macro
 def _compute_weights(
     partial_ub, squares_ub, bias_ub, totals, weights_ub, post_ub,
-    width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused,
+    width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused, simd_weights,
 ):
     with T.SimtVF(threads=32):
         for q in T.Parallel(32):
@@ -135,50 +170,53 @@ def _compute_weights(
                 for split in T.serial(splits):
                     value += partial_ub[split, q]
             totals[q] = value
-    with T.SimtVF(threads=32):
-        for lane in T.Parallel(1):
-            # Sinkhorn is serial within this lane. Publish only final weights to UB.
-            residual = T.alloc_local((16,), T.float32)
-            norm = T.sqrt(totals[24] / width) + 0.0001
-            for i in T.serial(4):
-                pre = alpha_pre * totals[i] / norm + bias_ub[i]
-                post = alpha_post * totals[4 + i] / norm + bias_ub[4 + i]
-                weights_ub[i] = 1.0 / (1.0 + T.exp(-pre))
-                post_ub[i] = 2.0 / (1.0 + T.exp(-post))
-            for i in T.serial(4):
-                row = i * 4
-                for j in T.serial(4):
-                    q = 8 + i * 4 + j
-                    residual[row + j] = alpha_res * totals[q] / norm + bias_ub[q]
-                row_max = T.alloc_var(T.float32, init=residual[row])
-                for j in T.serial(1, 4):
-                    row_max = T.max(row_max, residual[row + j])
-                for j in T.serial(4):
-                    residual[row + j] = T.exp(residual[row + j] - row_max)
-            for iteration in T.serial(repeat):
+    if simd_weights:
+        _normalize_simd(totals, bias_ub, weights_ub, post_ub, width, repeat, eps, alpha_pre, alpha_post, alpha_res)
+    else:
+        with T.SimtVF(threads=32):
+            for lane in T.Parallel(1):
+                # Sinkhorn is serial within this lane. Publish only final weights to UB.
+                residual = T.alloc_local((16,), T.float32)
+                norm = T.sqrt(totals[24] / width) + 0.0001
                 for i in T.serial(4):
-                    row_sum = T.alloc_var(T.float32, init=0.0)
+                    pre = alpha_pre * totals[i] / norm + bias_ub[i]
+                    post = alpha_post * totals[4 + i] / norm + bias_ub[4 + i]
+                    weights_ub[i] = 1.0 / (1.0 + T.exp(-pre))
+                    post_ub[i] = 2.0 / (1.0 + T.exp(-post))
+                for i in T.serial(4):
+                    row = i * 4
                     for j in T.serial(4):
-                        row_sum += residual[i * 4 + j]
+                        q = 8 + i * 4 + j
+                        residual[row + j] = alpha_res * totals[q] / norm + bias_ub[q]
+                    row_max = T.alloc_var(T.float32, init=residual[row])
+                    for j in T.serial(1, 4):
+                        row_max = T.max(row_max, residual[row + j])
                     for j in T.serial(4):
-                        residual[i * 4 + j] /= row_sum + eps
-                for j in T.serial(4):
-                    col_sum = T.alloc_var(T.float32, init=0.0)
+                        residual[row + j] = T.exp(residual[row + j] - row_max)
+                for iteration in T.serial(repeat):
                     for i in T.serial(4):
-                        col_sum += residual[i * 4 + j]
-                    for i in T.serial(4):
-                        residual[i * 4 + j] /= col_sum + eps
-            for i in T.serial(16):
-                weights_ub[4 + i] = residual[i]
-            for i in T.serial(20, 24):
-                weights_ub[i] = 0.0
+                        row_sum = T.alloc_var(T.float32, init=0.0)
+                        for j in T.serial(4):
+                            row_sum += residual[i * 4 + j]
+                        for j in T.serial(4):
+                            residual[i * 4 + j] /= row_sum + eps
+                    for j in T.serial(4):
+                        col_sum = T.alloc_var(T.float32, init=0.0)
+                        for i in T.serial(4):
+                            col_sum += residual[i * 4 + j]
+                        for i in T.serial(4):
+                            residual[i * 4 + j] /= col_sum + eps
+                for i in T.serial(16):
+                    weights_ub[4 + i] = residual[i]
+                for i in T.serial(20, 24):
+                    weights_ub[i] = 0.0
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def project_cube_fused(
     x, phi, partial, squares, partial_read, squares_read, bias, weights, h_post, x_res, x_layer, *,
     batch: int, width: int, chunk: int, cores: int, merge: bool,
-    tile: int = 64, full_pre: bool = False,
+    tile: int = 64, full_pre: bool = False, simd_weights: bool = False,
     repeat: int = 0, eps: float = 0.02,
     alpha_pre: float = 1.0, alpha_post: float = 1.0, alpha_res: float = 1.0,
 ):
@@ -220,8 +258,9 @@ def project_cube_fused(
             raw_ub = T.alloc_shared((half, cols), T.float32)
             partial_ub = T.alloc_shared((splits, cols), T.float32)
             split_squares_ub = T.alloc_shared((splits, 8), T.float32)
-            bias_ub = T.alloc_shared((24,), T.float32)
-            totals = T.alloc_shared((32,), T.float32)
+            # Dense SIMD loads read a full register even when only four lanes are used.
+            bias_ub = T.alloc_shared((88 if simd_weights else 24,), T.float32)
+            totals = T.alloc_shared((88 if simd_weights else 32,), T.float32)
             weights_ub = T.alloc_shared((24,), T.float32)
             post_ub = T.alloc_shared((8,), T.float32)
 
@@ -292,14 +331,14 @@ def project_cube_fused(
             with T.Stage(0):
                 with T.Task():
                     T.ascend_wait_flag("MTE3_MTE2", 7)
-                    T.copy(bias, bias_ub)
+                    T.copy(bias, bias_ub[0:24])
                 for step in T.serial(coefficient_jobs):
                     token = first + step * cores * 2
                     T.copy(partial_read[0:splits, token, 0:cols], partial_ub)
                     T.copy(squares_read[0:splits, token, 0:8], split_squares_ub)
                     _compute_weights(
                         partial_ub, split_squares_ub, bias_ub, totals, weights_ub, post_ub,
-                        width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True,
+                        width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, simd_weights,
                     )
                     if full_pre:
                         # Keep each token's weights on the Vector half that computed them.
@@ -353,7 +392,7 @@ def mix(
             T.copy(bias, bias_ub)
             _compute_weights(
                 partial_ub, squares_ub, bias_ub, totals, weights_ub, post_ub,
-                width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused,
+                width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused, False,
             )
             T.copy(weights_ub, weights[token, 0])
             T.copy(post_ub[0:4], h_post[token, 0])
