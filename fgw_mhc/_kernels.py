@@ -599,9 +599,10 @@ def project_cube_m_only(
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
     projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False, compute_squares: bool = True,
-    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0, split_k: int = 0, separate_nz: bool = False, block_nz: bool = False, weight_nk: bool = False, l0_ping_pong: bool = False, cached_input: bool = False, windowed_cache: bool = False, guarded_cache: bool = False,
+    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0, split_k: int = 0, separate_nz: bool = False, block_nz: bool = False, weight_nk: bool = False, l0_ping_pong: bool = False, cached_input: bool = False, windowed_cache: bool = False, guarded_cache: bool = False, double_input_stage: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
+    assert not double_input_stage or (guarded_cache and k_pipeline_stages == 2)
     assert not guarded_cache or windowed_cache
     assert not windowed_cache or cached_input
     assert not cached_input or (
@@ -647,6 +648,10 @@ def project_cube_m_only(
         if windowed_cache:
             T.annotate_buffer_versions({x_ub: 1})
         input_stage = T.alloc_shared((half, chunk), T.bfloat16) if guarded_cache else x_ub
+        if double_input_stage:
+            # Only the short-lived window buffer alternates. x_ub retains all
+            # windows at their original offsets for the final mixing pass.
+            T.annotate_buffer_versions({input_stage: (2, "iteration")})
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         cast_ub = T.alloc_shared((half, chunk + (8 if block_nz else 0)), T.float32) if separate_nz else nz_ub
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})

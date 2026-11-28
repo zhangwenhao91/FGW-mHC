@@ -60,7 +60,7 @@ def mhc_pre(
     _check_tensor("b", b, (mixes,), torch.float32, device)
 
     grouped_routes = {"cube_full_g2": 2, "cube_full_g4": 4}
-    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd_reduce", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_split", "vector", *grouped_routes):
+    if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd_reduce", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage", "cube_split", "vector", *grouped_routes):
         raise ValueError(f"Unknown mHC projection {projection!r}")
     if pre_tile is not None and (
         projection != "cube_full" or streams != 4 or hidden % 64 or type(pre_tile) is not int
@@ -74,7 +74,7 @@ def mhc_pre(
 
         return pre_reference(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkhorn_eps)
 
-    if projection in ("cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache"):
+    if projection in ("cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage"):
         chunk = gcd(width, 256) if projection == "cube_m_only" else 512
         if width % chunk:
             raise ValueError(f"{projection} requires K divisible by {chunk}")
@@ -83,13 +83,14 @@ def mhc_pre(
             "project_cube_m_only", batch=batch, width=width, chunk=chunk, tile=tile,
             repeat=sinkhorn_repeat, eps=float(sinkhorn_eps),
             alpha_pre=float(alpha_pre), alpha_post=float(alpha_post), alpha_res=float(alpha_res),
-            accumulate_squares=projection in ("cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache"),
-            k_pipeline_stages=2 if projection in ("cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache") else 1,
-            batch_coefficients=projection in ("cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache"),
+            accumulate_squares=projection in ("cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage"),
+            k_pipeline_stages=2 if projection in ("cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage") else 1,
+            batch_coefficients=projection in ("cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage"),
             l0_ping_pong=projection == "cube_m_only_k512_batched_l0",
-            cached_input=projection in ("cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache"),
-            windowed_cache=projection in ("cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache"),
-            guarded_cache=projection == "cube_m_only_k512_guarded_cache",
+            cached_input=projection in ("cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage"),
+            windowed_cache=projection in ("cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage"),
+            guarded_cache=projection in ("cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage"),
+            double_input_stage=projection == "cube_m_only_k512_double_stage",
         )
         x_res = torch.empty_like(x)
         layer = x.new_empty((batch, hidden))
