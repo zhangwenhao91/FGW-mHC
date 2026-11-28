@@ -5,9 +5,11 @@ from collections import defaultdict
 from itertools import permutations
 from pathlib import Path
 import csv
+from decimal import Decimal
 from difflib import unified_diff
 import math
 from statistics import median
+import sys
 
 from bench_mhc import CASES, time_us
 
@@ -108,6 +110,47 @@ def profile_projection(run, torch, profiler, directory, warmup, launches, *, war
                 line = source.readline()
                 if line:
                     print(line.rstrip(), flush=True)
+
+
+def summarize_post_cache(directory):
+    summaries = {}
+    for policy, context in (("normal_fv", "continuous_pair"), ("notalloc_ci", "continuous_pair_notalloc_ci")):
+        reports = sorted((directory / context).rglob("kernel_details.csv"))
+        if len(reports) != 1:
+            raise ValueError(f"Expected one kernel_details.csv for {context}, found {len(reports)}")
+
+        events = []
+        with reports[0].open(newline="", encoding="utf-8-sig") as source:
+            for row in csv.DictReader(source):
+                name = row["Name"].lower()
+                if "project_cube_m_only" in name:
+                    stage = "pre"
+                elif "post" in name:
+                    stage = "post"
+                else:
+                    continue
+                events.append((Decimal(row["Start Time(us)"].strip()), Decimal(row["Duration(us)"].strip()), stage))
+        events.sort(key=lambda event: event[0])
+        pairs = list(zip(events[::2], events[1::2]))
+        if len(pairs) < 2 or [event[2] for event in events] != ["pre", "post"] * len(pairs):
+            raise ValueError(f"Expected at least two alternating Pre/Post pairs in {reports[0]}")
+
+        def metrics(samples):
+            return (
+                median(pre[1] for pre, post in samples),
+                median(post[1] for pre, post in samples),
+                median(post[0] - (pre[0] + pre[1]) for pre, post in samples),
+                median(post[0] + post[1] - pre[0] for pre, post in samples),
+            )
+
+        summaries[policy] = (metrics(pairs[:1]), metrics(pairs[1:]))
+        print(f"{policy}: {reports[0]} ({len(pairs)} pairs)")
+
+    writer = csv.writer(sys.stdout, lineterminator="\n")
+    writer.writerow(("sample", "metric", "normal_fv_us", "notalloc_ci_us", "notalloc_minus_normal_us"))
+    for sample, normal, notalloc in zip(("first", "subsequent_median"), summaries["normal_fv"], summaries["notalloc_ci"]):
+        for name, first, second in zip(("pre", "post", "pre_to_post_gap", "pair_span"), normal, notalloc):
+            writer.writerow((sample, name, f"{first:.3f}", f"{second:.3f}", f"{second - first:+.3f}"))
 
 
 def profile_pre_context(writer, torch, args, inputs, layer_out, expected, batch, hidden):
@@ -407,6 +450,7 @@ def main():
     parser.add_argument("--compare-weight-layout", action="store_true", help="Compare KxN and prepacked NxK projection weights")
     parser.add_argument("--compare-block-nz", action="store_true", help="Compare fused NZ and vLLM-style block gather")
     parser.add_argument("--compare-separate-nz", action="store_true", help="Compare fused and separate AIV NZ conversion")
+    parser.add_argument("--summarize-post-cache", type=Path, help="Read existing Post cache profiling CSVs without an NPU")
     parser.add_argument("--compare-post-cache", action="store_true", help="Compare Post L2 store policies in the Pre context profile")
     parser.add_argument("--profile-pre-context", type=Path, help="Compare isolated and paired Pre pipeline utilization at N=4096")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
@@ -418,6 +462,12 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.summarize_post_cache:
+        try:
+            summarize_post_cache(args.summarize_post_cache)
+        except (OSError, ValueError, KeyError, ArithmeticError) as exc:
+            parser.exit(1, f"Could not summarize Post cache profile: {exc}\n")
+        return
     if args.compare_post_cache and not args.profile_pre_context:
         parser.error("--compare-post-cache requires --profile-pre-context")
     if args.profile_pre_context and (args.batch is not None or args.ablate_m_only or args.simd_reduce):
