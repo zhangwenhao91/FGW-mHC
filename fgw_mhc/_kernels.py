@@ -606,7 +606,7 @@ def project_cube_m_only(
         assert rows == 256
     mad_k = 32 if mad_k_override == 32 else min(chunk, 64 if rows == 256 else 256)
     assert chunk % mad_k == 0
-    assert not l0_ping_pong or (projection_only and chunk == 512 and mad_k == 256 and rows == 16 and not weight_nk)
+    assert not l0_ping_pong or ((projection_only or batch_coefficients) and chunk == 512 and mad_k == 256 and rows == 16 and not weight_nk)
     row_tiles = (batch + rows - 1) // rows
     jobs = row_tiles * shards
     cores = min(jobs, 28)

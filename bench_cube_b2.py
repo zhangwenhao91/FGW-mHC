@@ -23,6 +23,7 @@ def main():
     mode.add_argument("--simd-reduce", action="store_true", help="Compare SIMD partial reduction at 32 pairs per event")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
+    parser.add_argument("--l0-ping-pong", action="store_true", help="Compare L0 operand buffering in batched K512 Pre")
     parser.add_argument("--batch-coefficients", action="store_true", help="Compare per-token and batched coefficients in full K512 Pre")
     parser.add_argument("--deferred-pipeline", action="store_true", help="Compare one and two K stages in full deferred K512 Pre")
     parser.add_argument("--deferred-squares", action="store_true", help="Compare K512 with per-window and deferred square reductions")
@@ -40,6 +41,10 @@ def main():
 
     if args.debug_m_only and not args.m_only:
         parser.error("--debug-m-only requires --m-only")
+    if args.l0_ping_pong and (
+        not args.m_only_k_window or args.batch_coefficients or args.deferred_pipeline or args.deferred_squares
+    ):
+        parser.error("--l0-ping-pong requires --m-only-k-window without other comparisons")
     if args.batch_coefficients and (not args.m_only_k_window or args.deferred_pipeline or args.deferred_squares):
         parser.error("--batch-coefficients requires --m-only-k-window without other deferred comparisons")
     if args.deferred_pipeline and (not args.m_only_k_window or args.deferred_squares):
@@ -138,6 +143,8 @@ def main():
         routes = ("2560", "1280", "640")
     elif args.grouped_k:
         routes = ("cube_full", "cube_full_g2", "cube_full_g4")
+    elif args.l0_ping_pong:
+        routes = ("cube_m_only_k512_batched", "cube_m_only_k512_batched_l0")
     elif args.batch_coefficients:
         routes = ("cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched")
     elif args.deferred_pipeline:
