@@ -651,7 +651,7 @@ def project_cube_m_only(
         if double_input_stage:
             # Only the short-lived window buffer alternates. x_ub retains all
             # windows at their original offsets for the final mixing pass.
-            T.annotate_buffer_versions({input_stage: (2, "iteration")})
+            T.annotate_buffer_versions({input_stage: (2, "counter")})
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         cast_ub = T.alloc_shared((half, chunk + (8 if block_nz else 0)), T.float32) if separate_nz else nz_ub
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})

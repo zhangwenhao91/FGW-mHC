@@ -78,7 +78,10 @@ def mhc_pre(
         chunk = gcd(width, 256) if projection == "cube_m_only" else 512
         if width % chunk:
             raise ValueError(f"{projection} requires K divisible by {chunk}")
-        tile = hidden if hidden <= 4096 else gcd(hidden, 256)
+        # Leave UB space for both staging slots and the retained residual.
+        tile = 512 if projection == "cube_m_only_k512_double_stage" else (
+            hidden if hidden <= 4096 else gcd(hidden, 256)
+        )
         kernel = _compile(
             "project_cube_m_only", batch=batch, width=width, chunk=chunk, tile=tile,
             repeat=sinkhorn_repeat, eps=float(sinkhorn_eps),
