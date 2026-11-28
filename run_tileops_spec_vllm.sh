@@ -63,6 +63,9 @@ for mode in "${modes[@]}"; do
     vllm_output=(--output "$prefix-vllm.csv")
     if [[ "$mode" == profile || "$mode" == large-k512-*-profile || "$mode" == large-k512-profile ]]; then
         profile_batch=4
+        if [[ "$mode" == profile ]]; then
+            common+=(--pairs-per-event 32 --profile-steps 32)
+        fi
         if [[ "$mode" == large-k512* ]]; then
             profile_batch=4096
         fi
@@ -112,6 +115,9 @@ for mode in "${modes[@]}"; do
     fi
     if [[ "$mode" == profile || "$mode" == large-k512-*-profile || "$mode" == large-k512-profile ]]; then
         cat "$profile_dir"/{tilelang,vllm}/"b$profile_batch-h2560"/unprofiled-pair.csv
+        if [[ "$mode" == profile ]]; then
+            cat "$profile_dir"/{tilelang,vllm}/"b$profile_batch-h2560"/device-pair.csv
+        fi
         continue
     fi
     if [[ "$mode" == sweep ]]; then

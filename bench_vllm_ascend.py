@@ -115,6 +115,12 @@ def summarize_profile(directory, backend, steps):
         next_pre[0] - (post[0] + post[1])
         for (_, post), (next_pre, _) in zip(pairs, pairs[1:])
     ]
+    with (directory / "device-pair.csv").open("w", newline="", encoding="utf-8") as target:
+        writer = csv.writer(target)
+        writer.writerow(("backend", "pairs", "pre_us", "post_us", "pre_to_post_gap_us",
+                         "pair_span_us", "post_to_next_pre_gap_us"))
+        writer.writerow((backend, steps, *(f"{value:.6f}" for value in totals),
+                         f"{median(between_pairs):.6f}" if between_pairs else ""))
     gap_suffix = f", post_to_next_pre_gap={median(between_pairs):.3f} us" if between_pairs else ""
     print(f"{backend} device medians across {steps} profiled pairs: pre={totals[0]:.3f} us, "
           f"post={totals[1]:.3f} us, pre_to_post_gap={totals[2]:.3f} us, "
