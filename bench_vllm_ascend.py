@@ -184,7 +184,7 @@ def main():
                         help="Interleave the regular and fresh-output B4 TileLang paths in the sweep")
     parser.add_argument("--compare-tileops-dispatch", action="store_true",
                         help="Compare TileOPs public calls with its already-selected kernels")
-    parser.add_argument("--verify-b4-stream", action="store_true",
+    parser.add_argument("--verify-b4-stream", "--verify-mhc-stream", dest="verify_b4_stream", action="store_true",
                         help="Check the normal B4 calls on a non-default NPU stream before timing")
     parser.add_argument("--allocator-ab-b4", action="store_true",
                         help="Interleave Python and C++ allocation at the normal B4 entry points")
@@ -241,10 +241,10 @@ def main():
     if args.sweep_pairs is not None and min(args.sweep_pairs) < 1:
         parser.error("pair counts must be positive")
     if args.verify_b4_stream and (
-        args.backend != "tilelang" or args.batch != 4 or not args.sweep_pairs
+        args.backend != "tilelang" or args.batch not in (None, 4) or not args.sweep_pairs
         or args.projection != "cube_full" or args.full_h_double_post
     ):
-        parser.error("--verify-b4-stream requires a B4 TileLang cube_full sweep with default Post")
+        parser.error("--verify-mhc-stream requires a TileLang cube_full sweep with default Post")
     if args.allocator_ab_b4 and (
         args.backend != "tilelang" or args.batch != 4 or not args.sweep_pairs
         or args.projection != "cube_full" or args.compare_fresh_b4 or args.full_h_double_post
@@ -265,7 +265,7 @@ def main():
     if args.compare_tileops_dispatch and not tileops_repo:
         parser.error("--compare-tileops-dispatch requires FGW_MHC_TILEOPS_REPO")
     if tileops_repo and (not args.verify_b4_stream or args.compare_fresh_b4 or args.allocator_ab_b4):
-        parser.error("FGW_MHC_TILEOPS_REPO requires the normal B4 validation sweep")
+        parser.error("FGW_MHC_TILEOPS_REPO requires a normal mHC validation sweep")
     if args.merge:
         merge_results(*args.merge, args.output, cases=cases)
         return
@@ -502,7 +502,7 @@ def main():
                        zip((*first, first_out), (*second, second_out), strict=True)):
                     raise RuntimeError("B4 normal calls reused a live output on the non-default stream")
                 del first, second, first_out, second_out, outputs
-                print("B4 non-default stream and fresh outputs passed", flush=True)
+                print(f"B={batch} H={hidden} non-default stream and fresh outputs passed", flush=True)
 
             if args.sweep_pairs:
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair

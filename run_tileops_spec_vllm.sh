@@ -4,12 +4,14 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 card="${1:-4}"
+requested_mode="${2:-all}"
 case "${2:-all}" in
     all) modes=(stages pair); projection=cube_full; label=tileops-spec ;;
     tuned-pair) modes=(pair); projection=tileops_tuned; label=tileops-spec-tuned ;;
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
     tileops-dispatch-b4) modes=(sweep); projection=cube_full; label=tileops-spec-dispatch-b4 ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
+    validate-manifest) modes=(1 2 3 4); projection=cube_full; label="tileops-manifest-card$card-$(date +%Y%m%d-%H%M%S)-$$" ;;
     validate-b4) modes=(1 2 3 4); projection=cube_full; label="tileops-spec-validate-b4-card$card-$(date +%Y%m%d-%H%M%S)-$$" ;;
     allocator-ab-b4) modes=(sweep); projection=cube_full; label=tileops-spec-allocator-ab-b4 ;;
     allocate-b4) modes=(sweep); projection=cube_full; label=tileops-spec-allocate-b4 ;;
@@ -26,7 +28,7 @@ case "${2:-all}" in
     tiling-large) modes=(tiling); label=tileops-spec ;;
     large-k512-post-double) modes=(large-k512-post-double); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     profile-n4096-post-double) modes=(large-k512-post-double-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|tileops-dispatch-b4|compare-b4|direct-b4|allocate-b4|allocator-ab-b4|validate-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|tileops-dispatch-b4|compare-b4|direct-b4|allocate-b4|allocator-ab-b4|validate-b4|validate-manifest|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -36,9 +38,13 @@ for node in /dev/davinci[0-9]* /dev/hisi_hdc /dev/ummu /dev/uburma; do
     fi
 done
 
+validate=false
+if [[ "$requested_mode" == validate-b4 || "$requested_mode" == validate-manifest ]]; then
+    validate=true
+fi
 validation_csvs=()
 for mode in "${modes[@]}"; do
-    if [[ "${2:-all}" == validate-b4 ]]; then
+    if [[ "$validate" == true ]]; then
         round="$mode"
         mode=sweep
     fi
@@ -47,13 +53,16 @@ for mode in "${modes[@]}"; do
         stage_args=(--split-stages)
     fi
     prefix="$label-$mode-card$card"
-    if [[ "${2:-all}" == validate-b4 ]]; then
+    if [[ "$validate" == true ]]; then
         prefix="$label-round$round"
         validation_csvs+=("$prefix-tilelang.csv" "$prefix-vllm.csv")
     fi
     common=(--tileops-spec --device npu:0 "${stage_args[@]}")
     if [[ "$mode" == sweep ]]; then
-        common+=(--batch 4 --sweep-pairs 1 8 32)
+        common+=(--sweep-pairs 1 8 32)
+        if [[ "$requested_mode" != validate-manifest ]]; then
+            common+=(--batch 4)
+        fi
     fi
     merge_args=()
     baseline="$prefix-vllm.csv"
@@ -75,7 +84,7 @@ for mode in "${modes[@]}"; do
     if [[ "${2:-all}" == allocator-ab-b4 ]]; then
         tilelang_args+=(--allocator-ab-b4)
     fi
-    if [[ "${2:-all}" == validate-b4 ]]; then
+    if [[ "$validate" == true ]]; then
         tilelang_args+=(--verify-b4-stream)
     fi
     if [[ "${2:-all}" == compare-b4 || "${2:-all}" == direct-b4 || "${2:-all}" == allocate-b4 ]]; then
@@ -112,7 +121,7 @@ for mode in "${modes[@]}"; do
             "${common[@]}" "${tilelang_args[@]}" "${tilelang_output[@]}"
     }
     vllm_first=false
-    if [[ "${2:-all}" == validate-b4 ]] && (( round % 2 == 0 )); then
+    if [[ "$validate" == true ]] && (( round % 2 == 0 )); then
         vllm_first=true
     fi
     if [[ "$mode" != tiling && "$vllm_first" == false ]]; then
@@ -224,7 +233,7 @@ PY
     cat "$prefix-results.csv"
 done
 
-if [[ "${2:-all}" == validate-b4 ]]; then
+if [[ "$validate" == true ]]; then
     python - "${validation_csvs[@]}" <<'PY'
 import csv
 from statistics import mean, median
@@ -232,24 +241,27 @@ import sys
 
 def latencies(path):
     with open(path, newline="") as source:
-        return {(int(row["pairs_per_event"]), row["order"]): float(row["pair_us"])
-                for row in csv.DictReader(source)}
+        return {(int(row["batch"]), int(row["hidden"]), int(row["pairs_per_event"]), row["order"]):
+                float(row["pair_us"]) for row in csv.DictReader(source)}
 
 orders = ("forward", "reverse")
-ratios = {n: [] for n in (1, 8, 32)}
+ratios = {}
 paths = iter(sys.argv[1:])
 for round_id, (fgw_path, vllm_path) in enumerate(zip(paths, paths, strict=True), start=1):
     fgw, vllm = latencies(fgw_path), latencies(vllm_path)
-    for count, samples in ratios.items():
-        ours = mean(fgw[count, order] for order in orders)
-        baseline = mean(vllm[count, order] for order in orders)
-        samples.append(baseline / ours)
-        print(f"Round {round_id}, {count} pairs/event: FGW {ours:.3f} us, "
-              f"vLLM {baseline:.3f} us, {samples[-1]:.3f}x")
+    if not fgw or fgw.keys() != vllm.keys():
+        raise ValueError(f"Round {round_id} has mismatched B/H cases or event sizes")
+    for batch, hidden, count in sorted({key[:3] for key in fgw}):
+        ours = mean(fgw[batch, hidden, count, order] for order in orders)
+        baseline = mean(vllm[batch, hidden, count, order] for order in orders)
+        ratio = baseline / ours
+        ratios.setdefault((batch, hidden, count), []).append(ratio)
+        print(f"Round {round_id}, B={batch} H={hidden}, {count} pairs/event: "
+              f"candidate {ours:.3f} us, vLLM {baseline:.3f} us, {ratio:.3f}x")
 
-for count, samples in ratios.items():
+for (batch, hidden, count), samples in ratios.items():
     wins = sum(value > 1 for value in samples)
-    print(f"{count} pairs/event: median {median(samples):.3f}x, "
+    print(f"B={batch} H={hidden}, {count} pairs/event: median {median(samples):.3f}x, "
           f"range {min(samples):.3f} to {max(samples):.3f}x, wins {wins}/{len(samples)}")
 PY
 fi
