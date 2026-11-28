@@ -58,6 +58,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--large-post-tiles", action="store_true", help="Compare full-H tiles and double buffering for large-token Post")
+    mode.add_argument("--b4-post-tiles", action="store_true", help="Compare Post task layouts in the B=4 TileOPs pair")
     mode.add_argument("--post-streams", action="store_true", help="Time Post only with 1, 2, or 4 streams per task")
     mode.add_argument("--post-pipeline", action="store_true", help="Compare default, capped, and triple-buffered Post")
     mode.add_argument("--pre-h-tile", action="store_true", help="Compare cube_full Pre output H tiles at B=4")
@@ -118,6 +119,8 @@ def main():
     cases = ((1024, 2560), (4096, 2560)) if args.m_only_k_window or args.large_post_tiles else CASES
     if args.batch not in dict(cases):
         parser.error("--m-only-k-window and --large-post-tiles use batches 1024 and 4096, and other modes use 1, 2, or 4")
+    if args.b4_post_tiles and args.batch != 4:
+        parser.error("--b4-post-tiles requires --batch 4")
     if args.simd_reduce and args.batch != 4:
         parser.error("--simd-reduce requires --batch 4")
     if args.pre_h_tile and args.batch != 4:
@@ -147,7 +150,7 @@ def main():
     phi = phi.to(device)
     bias = bias.to(device)
     layer = layer.to(device, torch.bfloat16)
-    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile or args.m_only_k_window or args.large_post_tiles or args.simd_reduce else (20, 1e-6)
+    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile or args.m_only_k_window or args.large_post_tiles or args.simd_reduce or args.b4_post_tiles else (20, 1e-6)
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, *sinkhorn)
 
     if args.verify_windowed_cache:
@@ -200,12 +203,12 @@ def main():
             return mhc_post(*post_inputs, **post_options[route])
         if args.post_streams:
             return mhc_post(*post_inputs, streams_per_task=int(route))
-        projection = "cube_full" if args.post_pipeline or args.pre_h_tile else route
+        projection = "cube_full" if args.post_pipeline or args.pre_h_tile or args.b4_post_tiles else route
         pre_tile = int(route) if args.pre_h_tile else None
         residual, layer_in, post = mhc_pre(*inputs, projection=projection, pre_tile=pre_tile)
         if args.pre_only:
             return residual, layer_in, post
-        options = {}
+        options = post_options[route] if args.b4_post_tiles else {}
         if args.cache_pre_residual:
             options = {"post_tile": hidden, "pipeline": True, "pipeline_depth": 2}
         if args.post_pipeline and route != "post_default":
@@ -222,6 +225,8 @@ def main():
     routes = ROUTES
     if args.large_post_tiles:
         routes = ("default", "full_h_double") if args.post_pair else tuple(post_options)
+    elif args.b4_post_tiles:
+        routes = tuple(post_options)
     elif args.post_streams:
         routes = ("1", "2", "4")
     elif args.post_pipeline:
@@ -272,7 +277,7 @@ def main():
                 raise AssertionError(f"{route}, B={batch}, H={hidden}, {name}: {exc}") from exc
     torch.npu.synchronize()
 
-    pairs_per_event = 32 if args.simd_reduce else 8 if args.m_only_k_window or args.large_post_tiles else 1
+    pairs_per_event = 32 if args.simd_reduce or args.b4_post_tiles else 8 if args.m_only_k_window or args.large_post_tiles else 1
     if pairs_per_event > 1:
         for _ in range(args.warmup):
             for route in routes:
@@ -288,6 +293,8 @@ def main():
             variant = "pre_h_tile"
         if args.large_post_tiles:
             variant, metric = "post_config", "pair_us" if args.post_pair else "post_us"
+        if args.b4_post_tiles:
+            variant = "post_config"
         if args.pre_only:
             metric = "pre_us"
         if pairs_per_event > 1:
