@@ -454,7 +454,7 @@ def project_cube_fused(
 @T.macro
 def _m_only_k_window(
     x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares,
+    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
 ):
     k = part * chunk
     # The tail load zero-pads any rows outside the real batch.
@@ -471,6 +471,9 @@ def _m_only_k_window(
             squared = S.alloc_local((1,), T.float32)
             if compute_squares:
                 squared[0] = zero
+                if accumulate_squares:
+                    if part > 0:
+                        squared[0] = S.vld(squares_ub[0, row, 0])
             for col_tile in T.unroll(chunk // 64, explicit=True):
                 col = col_tile * 64
                 values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
@@ -479,8 +482,11 @@ def _m_only_k_window(
                 if compute_squares:
                     S.vmula(squared[0], values, values, full)
             if compute_squares:
-                total = S.vcadd(squared[0], full)
-                S.vsts(squares_ub[part, row, 0], S.vsel(total, zero, first), eight)
+                if accumulate_squares:
+                    S.vsts(squares_ub[0, row, 0], squared[0], full)
+                else:
+                    total = S.vcadd(squared[0], full)
+                    S.vsts(squares_ub[part, row, 0], S.vsel(total, zero, first), eight)
         if valid_rows < half:
             for row_index in T.serial(half - valid_rows):
                 row = valid_rows + row_index
@@ -516,9 +522,11 @@ def project_cube_m_only(
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
     projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False, compute_squares: bool = True,
+    accumulate_squares: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     assert projection_only or compute_squares
+    assert not accumulate_squares or (projection_only and compute_squares and k_pipeline_stages == 1 and not a_ping_pong)
     rows = 16
     half = rows // 2
     cols = 32
@@ -541,7 +549,7 @@ def project_cube_m_only(
         x_ub = T.alloc_shared((half, chunk), T.bfloat16)
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
-        squares_ub = T.alloc_shared((splits, half, 8), T.float32)
+        squares_ub = T.alloc_shared((1, half, 64) if accumulate_squares else (splits, half, 8), T.float32)
         a_l1 = T.alloc_l1((rows, chunk), T.float32)
         if a_ping_pong:
             a_next_l1 = T.alloc_l1((rows, chunk), T.float32)
@@ -569,23 +577,31 @@ def project_cube_m_only(
                 for window_pair in T.Pipelined(splits // 2, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares,
+                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
                     )
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_next_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares,
+                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
                     )
             else:
                 for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares,
+                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
                     )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
             for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
                 token = vector_m + row
-                if compute_squares:
+                if accumulate_squares:
+                    with T.SimdVF():
+                        full = S.pset(32)
+                        first = S.pset(32, "PAT_VL1")
+                        eight = S.pset(32, "PAT_VL8")
+                        zero = S.vdup(T.float32(0), T.float32, full)
+                        total = S.vcadd(S.vld(squares_ub[0, row, 0]), full)
+                        S.vsts(sum_ub[0, 0], S.vsel(total, zero, first), eight)
+                elif compute_squares:
                     with T.SimtVF(threads=32):
                         for lane in T.Parallel(8):
                             value = T.alloc_var(T.float32, init=0.0)

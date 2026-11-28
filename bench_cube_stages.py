@@ -109,11 +109,11 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         sources = {}
 
-        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True):
+        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
                 projection_only=True, k_pipeline_stages=stages, a_ping_pong=a_ping_pong,
-                compute_squares=compute_squares,
+                compute_squares=compute_squares, accumulate_squares=accumulate_squares,
             )
 
             if args.dump_projection_code is not None:
@@ -138,6 +138,8 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         if args.profile_projection:
             variants = (("projection_k512_stages1", prepare(512, 1)),)
+            if args.accumulate_squares:
+                variants += (("projection_k512_deferred_squares", prepare(512, 1, accumulate_squares=True)),)
             if args.compare_squares:
                 variants += (("projection_k512_no_squares", prepare(512, 1, compute_squares=False)),)
         elif args.projection_buffer_sweep:
@@ -219,6 +221,7 @@ def main():
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
     parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
+    parser.add_argument("--accumulate-squares", action="store_true", help="Compare per-window and deferred square reductions")
     parser.add_argument("--compare-squares", action="store_true", help="Also profile projection with squared sum disabled")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
@@ -229,6 +232,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.accumulate_squares and not args.profile_projection:
+        parser.error("--accumulate-squares requires --profile-projection")
     if args.compare_squares and not args.profile_projection:
         parser.error("--compare-squares requires --profile-projection")
     if args.profile_projection and (
