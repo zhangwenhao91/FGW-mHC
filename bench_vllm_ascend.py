@@ -184,6 +184,8 @@ def main():
                         help="Interleave the regular and fresh-output B4 TileLang paths in the sweep")
     parser.add_argument("--verify-b4-stream", action="store_true",
                         help="Check the normal B4 calls on a non-default NPU stream before timing")
+    parser.add_argument("--allocator-ab-b4", action="store_true",
+                        help="Interleave Python and C++ allocation at the normal B4 entry points")
     parser.add_argument("--compare-allocate-b4", action="store_true",
                         help="A/B test C++ batch allocation with exported launchers")
     parser.add_argument("--compare-direct-b4", action="store_true",
@@ -241,6 +243,11 @@ def main():
         or args.projection != "cube_full" or args.full_h_double_post
     ):
         parser.error("--verify-b4-stream requires a B4 TileLang cube_full sweep with default Post")
+    if args.allocator_ab_b4 and (
+        args.backend != "tilelang" or args.batch != 4 or not args.sweep_pairs
+        or args.projection != "cube_full" or args.compare_fresh_b4 or args.full_h_double_post
+    ):
+        parser.error("--allocator-ab-b4 requires a B4 TileLang cube_full sweep with default Post")
     if args.compare_allocate_b4 and not args.compare_direct_b4:
         parser.error("--compare-allocate-b4 requires --compare-direct-b4")
     if args.compare_direct_b4 and not args.compare_fresh_b4:
@@ -462,6 +469,18 @@ def main():
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
                 projection = projection_label if args.backend == "tilelang" else ""
                 candidates = ((projection, pair),)
+                if args.allocator_ab_b4:
+                    import fgw_mhc
+
+                    original_allocator = fgw_mhc._USE_CPP_PRE_ALLOCATOR
+                    allocators = {"python_pre": False, "cpp_pre": True}
+                    for enabled in allocators.values():
+                        fgw_mhc._USE_CPP_PRE_ALLOCATOR = enabled
+                        residual, layer_in, post = mhc_pre(*pre_args, projection=route)
+                        output = mhc_post(layer_out, post, residual)
+                        torch.testing.assert_close((residual, layer_in, post, output),
+                                                   (residual_ref, *expected), atol=0.01, rtol=0.01)
+                    candidates = tuple((name, pair) for name in allocators)
                 if args.compare_fresh_b4:
                     from bench_cube_b2 import prepare_fresh_pair
 
@@ -487,26 +506,33 @@ def main():
                         candidates += (("cube_full_fresh_direct_cpp", prepare_pair(True, cpp_allocate=True)),)
 
                 sizes = tuple(dict.fromkeys(args.sweep_pairs))
-                for order, counts, paths in (("forward", sizes, candidates),
-                                             ("reverse", sizes[::-1], candidates[::-1])):
-                    for count in counts:
-                        for label, op in paths:
-                            def submit():
-                                result = None
-                                for _ in range(count):
-                                    result = op()
-                                return result
+                cycles = 4 if args.allocator_ab_b4 else 1
+                for cycle in range(1, cycles + 1):
+                    for order, counts, paths in (("forward", sizes, candidates),
+                                                 ("reverse", sizes[::-1], candidates[::-1])):
+                        order_label = f"{cycle}-{order}" if args.allocator_ab_b4 else order
+                        for count in counts:
+                            for label, op in paths:
+                                if args.allocator_ab_b4:
+                                    fgw_mhc._USE_CPP_PRE_ALLOCATOR = allocators[label]
+                                def submit():
+                                    result = None
+                                    for _ in range(count):
+                                        result = op()
+                                    return result
 
-                            elapsed = time_us(op if count == 1 else submit, torch, args.warmup, args.repeat)
-                            if not math.isfinite(elapsed) or elapsed <= 0:
-                                raise RuntimeError(f"Invalid event time for {count} pairs: {elapsed}")
-                            per_pair = elapsed / count
-                            writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters, label,
-                                             count, order, f"{per_pair:.6f}"))
-                            output.flush()
-                            name = label if args.compare_fresh_b4 else args.backend
-                            print(f"{name} B={batch} H={hidden} {count} pairs/event {order}: "
-                                  f"{per_pair:.3f} us/pair", flush=True)
+                                elapsed = time_us(op if count == 1 else submit, torch, args.warmup, args.repeat)
+                                if not math.isfinite(elapsed) or elapsed <= 0:
+                                    raise RuntimeError(f"Invalid event time for {count} pairs: {elapsed}")
+                                per_pair = elapsed / count
+                                writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters, label,
+                                                 count, order_label, f"{per_pair:.6f}"))
+                                output.flush()
+                                name = label if args.compare_fresh_b4 or args.allocator_ab_b4 else args.backend
+                                print(f"{name} B={batch} H={hidden} {count} pairs/event {order_label}: "
+                                      f"{per_pair:.3f} us/pair", flush=True)
+                if args.allocator_ab_b4:
+                    fgw_mhc._USE_CPP_PRE_ALLOCATOR = original_allocator
                 continue
 
             if args.profile_dir:

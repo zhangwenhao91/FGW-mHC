@@ -10,6 +10,7 @@ case "${2:-all}" in
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
     validate-b4) modes=(1 2 3 4); projection=cube_full; label="tileops-spec-validate-b4-card$card-$(date +%Y%m%d-%H%M%S)-$$" ;;
+    allocator-ab-b4) modes=(sweep); projection=cube_full; label=tileops-spec-allocator-ab-b4 ;;
     allocate-b4) modes=(sweep); projection=cube_full; label=tileops-spec-allocate-b4 ;;
     direct-b4) modes=(sweep); projection=cube_full; label=tileops-spec-direct-b4 ;;
     compare-b4) modes=(sweep); projection=cube_full; label=tileops-spec-compare-b4 ;;
@@ -24,7 +25,7 @@ case "${2:-all}" in
     tiling-large) modes=(tiling); label=tileops-spec ;;
     large-k512-post-double) modes=(large-k512-post-double); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     profile-n4096-post-double) modes=(large-k512-post-double-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|compare-b4|direct-b4|allocate-b4|validate-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|compare-b4|direct-b4|allocate-b4|allocator-ab-b4|validate-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -67,6 +68,9 @@ for mode in "${modes[@]}"; do
         fi
     fi
     tilelang_args=()
+    if [[ "${2:-all}" == allocator-ab-b4 ]]; then
+        tilelang_args+=(--allocator-ab-b4)
+    fi
     if [[ "${2:-all}" == validate-b4 ]]; then
         tilelang_args+=(--verify-b4-stream)
     fi
@@ -157,6 +161,30 @@ for mode in "${modes[@]}"; do
     fi
     if [[ "$mode" == sweep ]]; then
         cat "$prefix-tilelang.csv" "$prefix-vllm.csv"
+        if [[ "${2:-all}" == allocator-ab-b4 ]]; then
+            python - "$prefix-tilelang.csv" "$prefix-vllm.csv" <<'PY'
+import csv
+from statistics import mean, median
+import sys
+
+def read(path):
+    with open(path, newline="") as source:
+        return {(int(row["pairs_per_event"]), row["order"], row["projection"]): float(row["pair_us"])
+                for row in csv.DictReader(source)}
+
+fgw, vllm = map(read, sys.argv[1:])
+for count in (1, 8, 32):
+    orders = ("forward", "reverse")
+    baseline = mean(vllm[count, order, ""] for order in orders)
+    python_us = [fgw[count, f"{cycle}-{order}", "python_pre"] for cycle in range(1, 5) for order in orders]
+    cpp_us = [fgw[count, f"{cycle}-{order}", "cpp_pre"] for cycle in range(1, 5) for order in orders]
+    deltas = [a - b for a, b in zip(python_us, cpp_us, strict=True)]
+    wins = sum(delta > 0 for delta in deltas)
+    print(f"{count} pairs/event: Python {median(python_us):.3f} us, C++ {median(cpp_us):.3f} us, "
+          f"paired saving {median(deltas):+.3f} us, C++ wins {wins}/{len(deltas)}, "
+          f"vLLM {baseline:.3f} us")
+PY
+        fi
         if [[ "${2:-all}" == compare-b4 || "${2:-all}" == direct-b4 || "${2:-all}" == allocate-b4 ]]; then
             python - "$prefix-tilelang.csv" "$prefix-vllm.csv" <<'PY'
 import csv
