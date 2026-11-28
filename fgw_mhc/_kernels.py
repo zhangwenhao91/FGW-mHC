@@ -99,7 +99,7 @@ def project_cube(x, phi, partial, *, batch: int, width: int, chunk: int):
 
 
 @T.macro
-def _apply_weights(x_ub, weights_ub, res_ub, layer_ub, tile, weight_stride):
+def _apply_weights(x_ub, weights_ub, res_ub, layer_ub, tile, weight_stride, weight_offset=0):
     with T.SimdVF():
         for chunk in T.serial(tile // 64):
             col = chunk * 64
@@ -107,14 +107,14 @@ def _apply_weights(x_ub, weights_ub, res_ub, layer_ub, tile, weight_stride):
             for i in T.unroll(4, explicit=True):
                 streams[i] = S.vcvt(S.vld(x_ub[i, col], dist="UNPK_B16"), T.float32, part=0)
             acc = S.alloc_local((1,), T.float32)
-            acc[0] = S.vmul(streams[0], S.vld(weights_ub[0], dist="BRC_B32"))
+            acc[0] = S.vmul(streams[0], S.vld(weights_ub[weight_offset], dist="BRC_B32"))
             for i in T.unroll(1, 4, explicit=True):
-                S.vmula(acc[0], streams[i], S.vld(weights_ub[i], dist="BRC_B32"))
+                S.vmula(acc[0], streams[i], S.vld(weights_ub[weight_offset + i], dist="BRC_B32"))
             S.vsts(layer_ub[col], S.vcvt(acc[0], T.bfloat16), dist="PK_B32")
             for row in T.unroll(4, explicit=True):
-                acc[0] = S.vmul(streams[0], S.vld(weights_ub[(row + 1) * weight_stride], dist="BRC_B32"))
+                acc[0] = S.vmul(streams[0], S.vld(weights_ub[weight_offset + (row + 1) * weight_stride], dist="BRC_B32"))
                 for i in T.unroll(1, 4, explicit=True):
-                    S.vmula(acc[0], streams[i], S.vld(weights_ub[(row + 1) * weight_stride + i], dist="BRC_B32"))
+                    S.vmula(acc[0], streams[i], S.vld(weights_ub[weight_offset + (row + 1) * weight_stride + i], dist="BRC_B32"))
                 S.vsts(res_ub[row, col], S.vcvt(acc[0], T.bfloat16), dist="PK_B32")
 
 
@@ -535,7 +535,7 @@ def project_cube_m_only(
     accumulate_squares: bool = False, batch_coefficients: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
-    assert not batch_coefficients or (coefficients_only and accumulate_squares and not debug and not projection_only)
+    assert not batch_coefficients or (accumulate_squares and not debug and not projection_only)
     assert projection_only or compute_squares
     assert not accumulate_squares or (compute_squares and not a_ping_pong and k_pipeline_stages in (1, 2))
     rows = 16
@@ -627,7 +627,15 @@ def project_cube_m_only(
                             )
                 for row in T.serial(row_count):
                     token = vector_m + row
-                    T.copy(row_weights[row * 24:row * 24 + 24], trace[token, 0:24])
+                    if coefficients_only:
+                        T.copy(row_weights[row * 24:row * 24 + 24], trace[token, 0:24])
+                    else:
+                        for column_tile in T.serial(hidden // tile):
+                            offset = column_tile * tile
+                            T.copy(streams[token, 0, offset], streams_ub)
+                            _apply_weights(streams_ub, row_weights, res_ub, layer_ub, tile, 4, row * 24)
+                            T.copy(res_ub, x_res[token, 0, offset])
+                            T.copy(layer_ub, x_layer[token, offset])
                     T.copy(row_post[row * 8:row * 8 + 4], h_post[token, 0:4])
             else:
                 for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
