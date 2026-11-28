@@ -32,6 +32,28 @@ def _run_kernel(name, kernel, *args):
     kernel(*args)
 
 
+@lru_cache(maxsize=32)
+def _b4_pre_kernel(alpha_pre, alpha_post, alpha_res, repeat, eps):
+    return _compile(
+        "project_cube_fused", batch=4, width=10240, chunk=256, cores=20,
+        merge=True, repeat=repeat, eps=eps, alpha_pre=alpha_pre,
+        alpha_post=alpha_post, alpha_res=alpha_res, full_pre=True, tile=2560,
+        simd_weights=False, skip_padding=False, k_group=1, simd_reduce=False,
+    )
+
+
+def _b4_pre(phi, x, bias, kernel, launch):
+    partial = bias.new_empty((40, 16, 32))
+    squares = bias.new_empty((40, 16, 8))
+    scratch = bias.new_empty((4, 24))
+    residual = x.new_empty((4, 4, 2560))
+    layer = x.new_empty((4, 2560))
+    weights = bias.new_empty((4, 4))
+    launch("pre", kernel, x, phi, partial, squares, partial, squares,
+           bias, scratch, weights, residual, layer)
+    return residual.view(4, 10240), layer, weights
+
+
 def mhc_pre(
     phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat,
     sinkhorn_eps=0.02, *, projection="cube", pre_tile=None, _launch=_run_kernel,
@@ -73,6 +95,11 @@ def mhc_pre(
         from .reference import pre_reference
 
         return pre_reference(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkhorn_eps)
+
+    if projection == "cube_full" and (batch, streams, hidden, pre_tile) == (4, 4, 2560, None):
+        kernel = _b4_pre_kernel(float(alpha_pre), float(alpha_post), float(alpha_res),
+                                sinkhorn_repeat, float(sinkhorn_eps))
+        return _b4_pre(phi, x, b, kernel, _launch)
 
     if projection in ("cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage"):
         chunk = gcd(width, 256) if projection == "cube_m_only" else 512
@@ -198,6 +225,14 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
         raise ValueError("pipeline_depth must be 2 or 3")
     if output_cache not in ("normal_fv", "notalloc_ci"):
         raise ValueError("output_cache must be normal_fv or notalloc_ci")
+    if ((batch, streams, hidden) == (4, 4, 2560)
+            and (num_vec_cores, streams_per_task, post_tile, output_cache) == (56, 4, None, "normal_fv")
+            and not pipeline):
+        kernel = _compile("post", batch=4, hidden=2560, tile=256, cores=40,
+                          stages=0, streams=4, total_streams=4, output_cache="normal_fv")
+        out = x_layer_out.new_empty((4, 4, 2560))
+        _launch("post", kernel, x_layer_out, h_post, x_res.view(4, 4, 2560), out)
+        return out.view(4, 10240)
     out = torch.empty_like(x_res)
     if not out.numel():
         return out
