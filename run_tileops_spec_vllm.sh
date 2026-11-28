@@ -18,7 +18,8 @@ case "${2:-all}" in
     large-k512-batched) modes=(large-k512-batched-pair large-k512-batched-stages); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     profile-n4096) modes=(large-k512-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     tiling-large) modes=(tiling); label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large]" >&2; exit 2 ;;
+    large-k512-post-double) modes=(large-k512-post-double); projection=cube_m_only_k512_batched; label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -51,6 +52,12 @@ for mode in "${modes[@]}"; do
             projection=cube_m_only
         fi
     fi
+    tilelang_args=()
+    if [[ "$mode" == large-k512-post-double ]]; then
+        common+=(--n4096-only)
+        merge_args+=(--n4096-only)
+        tilelang_args+=(--full-h-double-post)
+    fi
     tilelang_output=(--output "$prefix-tilelang.csv")
     vllm_output=(--output "$prefix-vllm.csv")
     if [[ "$mode" == profile || "$mode" == large-k512-profile ]]; then
@@ -65,7 +72,7 @@ for mode in "${modes[@]}"; do
     fi
     if [[ "$mode" != tiling ]]; then
         python bench_vllm_ascend.py --backend tilelang --projection "$projection" \
-            "${common[@]}" "${tilelang_output[@]}"
+            "${common[@]}" "${tilelang_args[@]}" "${tilelang_output[@]}"
     fi
     if [[ "$mode" != large-m-only ]]; then
         cann_env=()

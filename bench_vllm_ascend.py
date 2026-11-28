@@ -160,6 +160,8 @@ def main():
     parser.add_argument("--profile-batch", type=int)
     parser.add_argument("--profile-steps", type=int, default=12)
     parser.add_argument("--large-tokens", action="store_true", help="Measure 256, 1024, and 4096 tokens at H=2560")
+    parser.add_argument("--n4096-only", action="store_true", help="Limit K512 cases to N=4096")
+    parser.add_argument("--full-h-double-post", action="store_true", help="Use the full H tile with double buffering for TileLang Post")
     parser.add_argument("--large-k512-cases", action="store_true", help="Use the 1024 and 4096 token K512 workloads")
     parser.add_argument("--pairs-per-event", type=int, default=1)
     parser.add_argument("--tiling-only", action="store_true", help="Launch vLLM Pre once per case for CANN logging")
@@ -172,9 +174,13 @@ def main():
     if args.tiling_only and (args.backend != "vllm" or args.merge or args.profile_dir
                              or args.split_stages or args.sweep_pairs):
         parser.error("--tiling-only requires --backend vllm without timing modes")
+    if args.n4096_only and not args.large_k512_cases:
+        parser.error("--n4096-only requires --large-k512-cases")
+    if args.full_h_double_post and (not args.n4096_only or args.backend != "tilelang"):
+        parser.error("--full-h-double-post requires --n4096-only and --backend tilelang")
     if args.large_k512_cases:
         args.large_tokens = True
-        cases = LARGE_TOKEN_CASES[1:]
+        cases = LARGE_TOKEN_CASES[-1:] if args.n4096_only else LARGE_TOKEN_CASES[1:]
     else:
         cases = LARGE_TOKEN_CASES if args.large_tokens else CASES
     if args.pairs_per_event < 1 or (args.pairs_per_event > 1 and (
@@ -282,14 +288,15 @@ def main():
                 print(f"END vLLM HcPre N={batch} H={hidden}", flush=True)
                 continue
 
+            post_options = {"post_tile": hidden, "pipeline": True, "pipeline_depth": 2} if args.full_h_double_post else {}
             def tilelang_pair(trace=False):
                 if not trace:
                     residual, layer_in, post = mhc_pre(*pre_args, projection=route)
-                    return layer_in, post, mhc_post(layer_out, post, residual)
+                    return layer_in, post, mhc_post(layer_out, post, residual, **post_options)
                 with torch.profiler.record_function("fgw_pre"):
                     residual, layer_in, post = mhc_pre(*pre_args, projection=route)
                 with torch.profiler.record_function("fgw_post"):
-                    result = mhc_post(layer_out, post, residual)
+                    result = mhc_post(layer_out, post, residual, **post_options)
                 return layer_in, post, result
 
             def vllm_pair(trace=False):
@@ -317,7 +324,7 @@ def main():
                     torch.testing.assert_close((residual, layer_in, post), expected, atol=0.01, rtol=0.01)
 
                     def post_op():
-                        return mhc_post(layer_out, post, residual)
+                        return mhc_post(layer_out, post, residual, **post_options)
 
                     torch.testing.assert_close(
                         post_op(), post_reference(layer_out, post, residual), atol=0.01, rtol=0.01,

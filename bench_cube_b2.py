@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--batch-coefficients", action="store_true", help="Compare per-token and batched coefficients in full K512 Pre")
     parser.add_argument("--deferred-pipeline", action="store_true", help="Compare one and two K stages in full deferred K512 Pre")
     parser.add_argument("--deferred-squares", action="store_true", help="Compare K512 with per-window and deferred square reductions")
+    parser.add_argument("--post-pair", action="store_true", help="Time whole pairs in the large Post tile comparison")
     parser.add_argument("--pre-only", action="store_true", help="Time Pre without Post")
     parser.add_argument("--post-cores", type=int, choices=range(1, 57), metavar="1..56", default=8)
     parser.add_argument("--batch", type=int, choices=(*[batch for batch, _ in CASES], 1024, 4096), default=2)
@@ -40,6 +41,8 @@ def main():
     if min(args.cycles, args.warmup, args.repeat) < 1:
         parser.error("cycles, warmup and repeat must be positive")
 
+    if args.post_pair and (not args.large_post_tiles or args.pre_only):
+        parser.error("--post-pair requires --large-post-tiles without --pre-only")
     if args.debug_m_only and not args.m_only:
         parser.error("--debug-m-only requires --m-only")
     if args.l0_ping_pong and (
@@ -108,8 +111,9 @@ def main():
             print(f"{name} actual={actual.tolist()} expected={reference.tolist()}", flush=True)
 
     if args.large_post_tiles:
-        residual, _, weights = mhc_pre(*inputs, projection="cube_m_only_k512_batched")
-        post_inputs = (layer, weights, residual)
+        if not args.post_pair:
+            residual, _, weights = mhc_pre(*inputs, projection="cube_m_only_k512_batched")
+            post_inputs = (layer, weights, residual)
         post_options = {
             "default": {},
             "full_h": {"post_tile": hidden},
@@ -119,9 +123,12 @@ def main():
         weights = torch.randn(batch, 4, generator=rng).to(device)
         post_inputs = (layer, weights, x)
 
-    post_only = args.post_streams or args.large_post_tiles
+    post_only = args.post_streams or (args.large_post_tiles and not args.post_pair)
 
     def run(route):
+        if args.post_pair:
+            residual, layer_in, weights = mhc_pre(*inputs, projection="cube_m_only_k512_batched")
+            return residual, layer_in, weights, mhc_post(layer, weights, residual, **post_options[route])
         if args.large_post_tiles:
             return mhc_post(*post_inputs, **post_options[route])
         if args.post_streams:
@@ -145,7 +152,7 @@ def main():
             expected += (post_reference(layer, post, residual),)
     routes = ROUTES
     if args.large_post_tiles:
-        routes = tuple(post_options)
+        routes = ("default", "full_h_double") if args.post_pair else tuple(post_options)
     elif args.post_streams:
         routes = ("1", "2", "4")
     elif args.post_pipeline:
@@ -182,7 +189,7 @@ def main():
             (expected,) if post_only else expected,
         ):
             try:
-                atol = 0.02 if args.m_only_k_window and name == "pair" else 0.01
+                atol = 0.02 if (args.m_only_k_window or args.post_pair) and name == "pair" else 0.01
                 torch.testing.assert_close(value, reference, atol=atol, rtol=0.01)
             except AssertionError as exc:
                 raise AssertionError(f"{route}, B={batch}, H={hidden}, {name}: {exc}") from exc
@@ -203,7 +210,7 @@ def main():
         if args.pre_h_tile:
             variant = "pre_h_tile"
         if args.large_post_tiles:
-            variant, metric = "post_config", "post_us"
+            variant, metric = "post_config", "pair_us" if args.post_pair else "post_us"
         if args.pre_only:
             metric = "pre_us"
         if pairs_per_event > 1:
