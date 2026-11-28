@@ -299,9 +299,6 @@ def main():
         import tileops.ascend  # noqa: F401
         from tileops.sequence_modeling import MHCPostFwdOp, MHCPreFwdOp
 
-        tileops_pre = MHCPreFwdOp(1.0, 1.0, 1.0, args.sinkhorn_iters, eps)
-        tileops_post = MHCPostFwdOp()
-
     device = torch.device(args.device)
     if args.backend != "tilelang":
         try:
@@ -387,6 +384,10 @@ def main():
                 continue
 
             if tileops_repo:
+                # Kernel caches belong to the workload being validated.
+                tileops_pre = MHCPreFwdOp(1.0, 1.0, 1.0, args.sinkhorn_iters, eps)
+                tileops_post = MHCPostFwdOp()
+
                 def tilelang_pair():
                     residual, layer_in, post = tileops_pre(phi, x, bias)
                     return layer_in, post, tileops_post(layer_out, post, residual)
