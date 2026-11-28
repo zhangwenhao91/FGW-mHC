@@ -2,6 +2,7 @@
 
 import argparse
 from collections import defaultdict
+from itertools import permutations
 import csv
 import math
 from statistics import median
@@ -64,7 +65,9 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     layer = x.new_empty((batch, hidden))
     post = bias.new_empty((batch, 4))
     weights = bias.new_empty((batch, 24))
+    projection = bias.new_empty((batch, 32))
     full = _compile("project_cube_m_only", **config)
+    project = _compile("project_cube_m_only", **config, projection_only=True)
     ablated = _compile("project_cube_m_only", **config, coefficients_only=True)
 
     def run_full():
@@ -72,6 +75,9 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
     def run_ablated():
         ablated(x, phi, bias, post, residual, layer, weights)
+
+    def run_project():
+        project(x, phi, bias, post, residual, layer, projection)
 
     run_full()
     torch.testing.assert_close((residual.flatten(1), layer, post), expected, atol=0.01, rtol=0.01)
@@ -81,10 +87,15 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     rebuilt_layer = torch.bmm(weights[:, None, :4], streams).squeeze(1).bfloat16()
     torch.testing.assert_close((rebuilt_residual, rebuilt_layer, post), expected, atol=0.01, rtol=0.01)
 
-    variants = (("full_pre", run_full), ("coefficients_only", run_ablated))
+    run_project()
+    flat = streams.flatten(1)
+    torch.testing.assert_close(projection[:, :24], flat @ phi, atol=0.01, rtol=0.01)
+    torch.testing.assert_close(projection[:, 24], flat.square().sum(-1), atol=0.01, rtol=0.01)
+
+    variants = (("full_pre", run_full), ("coefficients_only", run_ablated), ("projection_only", run_project))
     samples = defaultdict(list)
     count = args.launches_per_event
-    for order in (variants, variants[::-1], variants, variants[::-1]):
+    for order in permutations(variants):
         for name, run in order:
             def submit():
                 for _ in range(count):
@@ -102,7 +113,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--simd-reduce", action="store_true", help="Compare baseline and SIMD partial reduction")
-    parser.add_argument("--ablate-m-only", action="store_true", help="Compare full Pre and coefficients-only at N=1024 and 4096")
+    parser.add_argument("--ablate-m-only", action="store_true", help="Compare full Pre, coefficients, and projection at N=1024 and 4096")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
     parser.add_argument("--launches-per-event", type=int, default=1,
