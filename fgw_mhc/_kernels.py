@@ -526,7 +526,7 @@ def project_cube_m_only(
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     assert projection_only or compute_squares
-    assert not accumulate_squares or (projection_only and compute_squares and k_pipeline_stages == 1 and not a_ping_pong)
+    assert not accumulate_squares or (compute_squares and k_pipeline_stages == 1 and not a_ping_pong)
     rows = 16
     half = rows // 2
     cols = 32

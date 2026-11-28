@@ -23,6 +23,7 @@ def main():
     mode.add_argument("--simd-reduce", action="store_true", help="Compare SIMD partial reduction at 32 pairs per event")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
+    parser.add_argument("--deferred-squares", action="store_true", help="Compare K512 with per-window and deferred square reductions")
     parser.add_argument("--pre-only", action="store_true", help="Time Pre without Post")
     parser.add_argument("--post-cores", type=int, choices=range(1, 57), metavar="1..56", default=8)
     parser.add_argument("--batch", type=int, choices=(*[batch for batch, _ in CASES], 1024, 4096), default=2)
@@ -37,6 +38,8 @@ def main():
 
     if args.debug_m_only and not args.m_only:
         parser.error("--debug-m-only requires --m-only")
+    if args.deferred_squares and not args.m_only_k_window:
+        parser.error("--deferred-squares requires --m-only-k-window")
     cases = ((1024, 2560), (4096, 2560)) if args.m_only_k_window else CASES
     if args.batch not in dict(cases):
         parser.error("--m-only-k-window uses batches 1024 and 4096, and other modes use 1, 2, or 4")
@@ -129,6 +132,8 @@ def main():
         routes = ("2560", "1280", "640")
     elif args.grouped_k:
         routes = ("cube_full", "cube_full_g2", "cube_full_g4")
+    elif args.deferred_squares:
+        routes = ("cube_m_only_k512", "cube_m_only_k512_deferred")
     elif args.m_only_k_window:
         routes = ("cube_m_only", "cube_m_only_k512")
     elif args.m_only:
