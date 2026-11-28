@@ -81,6 +81,11 @@ def mhc_pre(
     _check_tensor("phi", phi, (width, mixes), torch.float32, device)
     _check_tensor("b", b, (mixes,), torch.float32, device)
 
+    if projection == "cube_full" and (batch, streams, hidden, pre_tile) == (4, 4, 2560, None):
+        kernel = _b4_pre_kernel(float(alpha_pre), float(alpha_post), float(alpha_res),
+                                sinkhorn_repeat, float(sinkhorn_eps))
+        return _b4_pre(phi, x, b, kernel, _launch)
+
     grouped_routes = {"cube_full_g2": 2, "cube_full_g4": 4}
     if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd_reduce", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage", "cube_split", "vector", *grouped_routes):
         raise ValueError(f"Unknown mHC projection {projection!r}")
@@ -95,11 +100,6 @@ def mhc_pre(
         from .reference import pre_reference
 
         return pre_reference(phi, x, b, alpha_pre, alpha_post, alpha_res, sinkhorn_repeat, sinkhorn_eps)
-
-    if projection == "cube_full" and (batch, streams, hidden, pre_tile) == (4, 4, 2560, None):
-        kernel = _b4_pre_kernel(float(alpha_pre), float(alpha_post), float(alpha_res),
-                                sinkhorn_repeat, float(sinkhorn_eps))
-        return _b4_pre(phi, x, b, kernel, _launch)
 
     if projection in ("cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage"):
         chunk = gcd(width, 256) if projection == "cube_m_only" else 512
@@ -203,6 +203,12 @@ def mhc_pre(
     return x_res, x_layer, h_post
 
 
+@lru_cache(maxsize=1)
+def _b4_post_kernel():
+    return _compile("post", batch=4, hidden=2560, tile=256, cores=40,
+                    stages=0, streams=4, total_streams=4, output_cache="normal_fv")
+
+
 def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, streams_per_task=4,
              post_tile=None, pipeline_depth=3, output_cache="normal_fv", _launch=_run_kernel):
     """Return the flattened BF16 residual plus the scaled layer output."""
@@ -228,10 +234,8 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
     if ((batch, streams, hidden) == (4, 4, 2560)
             and (num_vec_cores, streams_per_task, post_tile, output_cache) == (56, 4, None, "normal_fv")
             and not pipeline):
-        kernel = _compile("post", batch=4, hidden=2560, tile=256, cores=40,
-                          stages=0, streams=4, total_streams=4, output_cache="normal_fv")
         out = x_layer_out.new_empty((4, 4, 2560))
-        _launch("post", kernel, x_layer_out, h_post, x_res.view(4, 4, 2560), out)
+        _launch("post", _b4_post_kernel(), x_layer_out, h_post, x_res.view(4, 4, 2560), out)
         return out.view(4, 10240)
     out = torch.empty_like(x_res)
     if not out.numel():
