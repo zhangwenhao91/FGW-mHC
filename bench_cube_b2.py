@@ -193,6 +193,13 @@ def main():
         weights = torch.randn(batch, 4, generator=rng).to(device)
         post_inputs = (layer, weights, x)
 
+    if args.b4_post_tiles:
+        post_options = {
+            "default": {},
+            "two_streams_h512": {"streams_per_task": 2, "post_tile": 512},
+            "four_streams_h256": {"streams_per_task": 4, "post_tile": 256},
+        }
+
     post_only = args.post_streams or (args.large_post_tiles and not args.post_pair)
 
     def run(route):
