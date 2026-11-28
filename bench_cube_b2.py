@@ -10,7 +10,7 @@ from bench_mhc import CASES, time_us
 ROUTES = ("cube", "cube_mk", "cube_full")
 
 
-def verify_windowed_cache(torch, inputs, layer, source_path):
+def verify_windowed_cache(torch, inputs, layer, source_path, route):
     from fgw_mhc import mhc_post, mhc_pre
     from fgw_mhc.reference import post_reference, pre_reference
 
@@ -30,7 +30,6 @@ def verify_windowed_cache(torch, inputs, layer, source_path):
         source_path.write_text(source, encoding="utf-8")
         kernel(*tensors)
 
-    route = "cube_m_only_k512_windowed_cache"
     mhc_pre(*inputs, projection=route, _launch=dump_launch)
     torch.npu.synchronize()
     print(f"Generated device source: {source_path}", flush=True)
@@ -70,6 +69,7 @@ def main():
     mode.add_argument("--simd-reduce", action="store_true", help="Compare SIMD partial reduction at 32 pairs per event")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
+    parser.add_argument("--guarded-window-cache", action="store_true", help="Compare windowed caching with per-window MTE2 reuse guards")
     parser.add_argument("--verify-windowed-cache", type=Path, help="Dump device source and stress-test the windowed cache path")
     parser.add_argument("--cache-pre-residual", action="store_true", help="Compare retaining Pre input residual in UB")
     parser.add_argument("--l0-ping-pong", action="store_true", help="Compare L0 operand buffering in batched K512 Pre")
@@ -93,6 +93,8 @@ def main():
         parser.error("--post-pair requires --large-post-tiles without --pre-only")
     if args.debug_m_only and not args.m_only:
         parser.error("--debug-m-only requires --m-only")
+    if args.guarded_window_cache and not args.cache_pre_residual:
+        parser.error("--guarded-window-cache requires --cache-pre-residual")
     if args.verify_windowed_cache and (not args.cache_pre_residual or args.pre_only):
         parser.error("--verify-windowed-cache requires --cache-pre-residual without --pre-only")
     if args.cache_pre_residual and (
@@ -146,7 +148,8 @@ def main():
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, *sinkhorn)
 
     if args.verify_windowed_cache:
-        verify_windowed_cache(torch, inputs, layer, args.verify_windowed_cache)
+        route = "cube_m_only_k512_guarded_cache" if args.guarded_window_cache else "cube_m_only_k512_windowed_cache"
+        verify_windowed_cache(torch, inputs, layer, args.verify_windowed_cache, route)
         return
 
     if args.debug_m_only:
@@ -226,6 +229,8 @@ def main():
         routes = ("2560", "1280", "640")
     elif args.grouped_k:
         routes = ("cube_full", "cube_full_g2", "cube_full_g4")
+    elif args.guarded_window_cache:
+        routes = ("cube_m_only_k512_batched", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache")
     elif args.cache_pre_residual:
         routes = (
             "cube_m_only_k512_batched", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache",
