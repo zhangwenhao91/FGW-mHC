@@ -464,7 +464,7 @@ def project_cube_fused(
 @T.macro
 def _m_only_k_window(
     x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, k_base=0,
+    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, k_base=0,
 ):
     k = k_base + part * chunk
     # The tail load zero-pads any rows outside the real batch.
@@ -507,7 +507,16 @@ def _m_only_k_window(
                     col = col_tile * 64
                     ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
                     S.vsstb(zero, ptr, nz_stride, full)
-    if separate_nz:
+    if block_nz:
+        with T.SimdVF():
+            full = S.pset(32)
+            # Gather one 32-byte block from each of the eight padded ND rows.
+            row_blocks = T.reinterpret("uint32x64", S.vmuls(S.vci(0, "int32"), chunk // 8 + 1, full))
+            for col_block in T.serial(chunk // 8):
+                col = col_block * 8
+                values = S.vgatherb(cast_ub[0, col], row_blocks, full)
+                S.vsts(nz_ub[0, col], values, full)
+    elif separate_nz:
         with T.SimdVF():
             full = S.pset(32)
             zero = S.vdup(T.float32(0), T.float32, full)
@@ -549,9 +558,10 @@ def project_cube_m_only(
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
     projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False, compute_squares: bool = True,
-    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0, split_k: int = 0, separate_nz: bool = False,
+    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0, split_k: int = 0, separate_nz: bool = False, block_nz: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
+    assert not block_nz or (separate_nz and rows == 16 and batch % rows == 0)
     assert not separate_nz or (projection_only and accumulate_squares and not split_k)
     assert not batch_coefficients or (accumulate_squares and not debug and not projection_only)
     assert projection_only or compute_squares
@@ -588,7 +598,7 @@ def project_cube_m_only(
     with T.MixedKernel(cores) as (core, side):
         x_ub = T.alloc_shared((half, chunk), T.bfloat16)
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
-        cast_ub = T.alloc_shared((half, chunk), T.float32) if separate_nz else nz_ub
+        cast_ub = T.alloc_shared((half, chunk + (8 if block_nz else 0)), T.float32) if separate_nz else nz_ub
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
         squares_ub = T.alloc_shared((1, half, 64) if accumulate_squares else (splits, half, 8), T.float32)
         a_l1 = T.alloc_l1((rows, chunk), T.float32)
@@ -626,24 +636,24 @@ def project_cube_m_only(
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
                         vector_m, part, batch, half, cols, chunk, mad_k, window_count,
-                        compute_squares, accumulate_squares, cast_ub, separate_nz, k_base,
+                        compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, k_base,
                     )
             elif a_ping_pong:
                 # Each call names its own A buffer so the scheduler can track slot reuse.
                 for window_pair in T.Pipelined(splits // 2, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz,
+                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz,
                     )
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_next_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz,
+                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz,
                     )
             else:
                 for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz,
+                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz,
                     )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
