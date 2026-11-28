@@ -10,7 +10,8 @@ case "${2:-all}" in
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
     large-pair) modes=(large-full large-m-only); projection=cube_full; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair]" >&2; exit 2 ;;
+    large-stages) modes=(large-stages); projection=cube_m_only; label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -22,7 +23,7 @@ done
 
 for mode in "${modes[@]}"; do
     stage_args=()
-    if [[ "$mode" == stages ]]; then
+    if [[ "$mode" == stages || "$mode" == large-stages ]]; then
         stage_args=(--split-stages)
     fi
     prefix="$label-$mode-card$card"
@@ -35,8 +36,8 @@ for mode in "${modes[@]}"; do
     if [[ "$mode" == large-* ]]; then
         common+=(--large-tokens)
         merge_args+=(--large-tokens)
-        baseline="$label-large-full-card$card-vllm.csv"
         if [[ "$mode" == large-m-only ]]; then
+            baseline="$label-large-full-card$card-vllm.csv"
             projection=cube_m_only
         fi
     fi
