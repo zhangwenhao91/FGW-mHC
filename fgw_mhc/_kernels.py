@@ -517,8 +517,9 @@ def _m_only_k_window(
             indices = T.reinterpret("uint32x64", S.vadd(lane, S.vmuls(row, chunk, full), full))
             for col_block in T.serial(chunk // 8):
                 col = col_block * 8
-                source = T.access_ptr(cast_ub[0, col], "r", extent=half * (chunk + 8) - col)
-                values = S.vgather2(source, indices, full)
+                values = S.vgather2(
+                    T.access_ptr(cast_ub[0, col], "r", extent=half * (chunk + 8) - col), indices, full,
+                )
                 S.vsts(nz_ub[0, col], values, full)
     elif separate_nz:
         with T.SimdVF():
