@@ -167,8 +167,8 @@ def profile_pre_context(writer, torch, args, inputs, layer_out, expected, batch,
             pipeline_depth=2, output_cache=cache,
         )
 
-    def pair(cache):
-        residual, _, post = pre()
+    def pair(cache, run_pre=pre):
+        residual, _, post = run_pre()
         return run_post(residual, post, cache)
 
     residual, layer, post = pre()
@@ -195,6 +195,21 @@ def profile_pre_context(writer, torch, args, inputs, layer_out, expected, batch,
         alternating_pre()
         torch.testing.assert_close(alternating_pre(), expected, atol=0.01, rtol=0.01)
         variants += (("alternating_input_pre", alternating_pre),)
+    cached_variants = ()
+    if args.compare_ub_residual:
+        def cached_pre():
+            return mhc_pre(*inputs, projection="cube_m_only_k512_cached_input")
+
+        torch.testing.assert_close(cached_pre(), expected, atol=0.01, rtol=0.01)
+        torch.testing.assert_close(
+            pair("normal_fv", cached_pre), expected_post, atol=0.02, rtol=0.01,
+        )
+        cached_variants = (
+            ("standalone_pre_ub_residual", cached_pre),
+            ("continuous_pair_ub_residual", lambda: pair("normal_fv", cached_pre)),
+        )
+        variants += cached_variants
+    cached_names = {name for name, _ in cached_variants}
     count = args.launches_per_event
     for phase in ("before", "after"):
         if phase == "after":
@@ -210,7 +225,8 @@ def profile_pre_context(writer, torch, args, inputs, layer_out, expected, batch,
                 return run()
 
             elapsed = time_us(submit, torch, args.warmup, args.repeat) / count
-            writer.writerow((batch, hidden, "cube_m_only_k512_batched", f"{name}_{phase}", f"{elapsed:.3f}", count, 1, 0.02))
+            route = "cube_m_only_k512_cached_input" if name in cached_names else "cube_m_only_k512_batched"
+            writer.writerow((batch, hidden, route, f"{name}_{phase}", f"{elapsed:.3f}", count, 1, 0.02))
             print(f"N={batch} H={hidden} {name} {phase} profile: {elapsed:.3f} us", flush=True)
 
 
@@ -465,6 +481,7 @@ def main():
     parser.add_argument("--compare-block-nz", action="store_true", help="Compare fused NZ and vLLM-style block gather")
     parser.add_argument("--compare-separate-nz", action="store_true", help="Compare fused and separate AIV NZ conversion")
     parser.add_argument("--summarize-post-cache", type=Path, help="Read existing Post cache profiling CSVs without an NPU")
+    parser.add_argument("--compare-ub-residual", action="store_true", help="Profile the baseline and UB-resident residual Pre in both contexts")
     parser.add_argument("--compare-pre-input-reuse", action="store_true", help="Profile independent Pre while alternating two equal residual buffers")
     parser.add_argument("--compare-post-cache", action="store_true", help="Compare Post L2 store policies in the Pre context profile")
     parser.add_argument("--profile-pre-context", type=Path, help="Compare isolated and paired Pre pipeline utilization at N=4096")
@@ -483,6 +500,10 @@ def main():
         except (OSError, ValueError, KeyError, ArithmeticError) as exc:
             parser.exit(1, f"Could not summarize Post cache profile: {exc}\n")
         return
+    if args.compare_ub_residual and (
+        not args.profile_pre_context or args.compare_pre_input_reuse or args.compare_post_cache
+    ):
+        parser.error("--compare-ub-residual requires --profile-pre-context without other context comparisons")
     if args.compare_pre_input_reuse and (not args.profile_pre_context or args.compare_post_cache):
         parser.error("--compare-pre-input-reuse requires --profile-pre-context without --compare-post-cache")
     if args.compare_post_cache and not args.profile_pre_context:
