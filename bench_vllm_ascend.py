@@ -143,7 +143,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--repeat", type=int, default=100)
-    parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "tileops_tuned"), default="cube")
+    parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "tileops_tuned"), default="cube")
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
     parser.add_argument("--sweep-pairs", type=int, nargs="+", metavar="PAIRS",

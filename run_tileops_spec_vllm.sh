@@ -15,7 +15,8 @@ case "${2:-all}" in
     large-k512-stages) modes=(large-k512-stages); projection=cube_m_only_k512; label=tileops-spec ;;
     large-k512-deferred-pair) modes=(large-k512-deferred-pair); projection=cube_m_only_k512_deferred; label=tileops-spec ;;
     large-k512-s2) modes=(large-k512-s2-pair large-k512-s2-stages); projection=cube_m_only_k512_deferred_s2; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2]" >&2; exit 2 ;;
+    large-k512-batched) modes=(large-k512-batched-pair large-k512-batched-stages); projection=cube_m_only_k512_batched; label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
