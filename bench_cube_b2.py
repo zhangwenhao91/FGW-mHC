@@ -45,15 +45,9 @@ def prepare_fresh_pair(inputs, layer, projection, *, direct_launch=False, cpp_al
 
     allocate = allocate_python
     if cpp_allocate:
-        from torch.utils.cpp_extension import load
+        from fgw_mhc import _allocation_module
 
-        module = load(
-            name="fgw_mhc_bench_allocate",
-            sources=[str(Path(__file__).with_name("bench_mhc_allocate.cpp").resolve())],
-            extra_cflags=["-O2", "-g0"],
-            with_cuda=False,
-        )
-        allocate_native = module.bind_allocate(layer, partial_shape, squares_shape, batch, hidden)
+        allocate_native = _allocation_module().bind_allocate(layer, partial_shape, squares_shape, batch, hidden)
 
         def allocate(x, bias):
             return allocate_native()

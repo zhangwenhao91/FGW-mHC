@@ -2,10 +2,13 @@
 
 from functools import lru_cache
 from math import gcd, isqrt
+import os
 
 import torch
 
 __all__ = ["mhc_pre", "mhc_post"]
+
+_USE_CPP_PRE_ALLOCATOR = os.getenv("FGW_MHC_CPP_PRE_ALLOCATOR") == "1"
 
 
 def _check_tensor(name, tensor, shape, dtype, device):
@@ -53,13 +56,36 @@ def _b4_pre_kernel(alpha_pre, alpha_post, alpha_res, repeat, eps):
     )
 
 
+@lru_cache(maxsize=1)
+def _allocation_module():
+    from pathlib import Path
+
+    from torch.utils.cpp_extension import load
+
+    return load(
+        name="fgw_mhc_allocate",
+        sources=[str(Path(__file__).with_name("_allocate.cpp"))],
+        extra_cflags=["-O2", "-g0"],
+        with_cuda=False,
+    )
+
+
+@lru_cache(maxsize=8)
+def _b4_pre_allocator(device):
+    options = torch.empty(0, device=device, dtype=torch.bfloat16)
+    return _allocation_module().bind_pre_allocate(options, (40, 16, 32), (40, 16, 8), 4, 2560)
+
+
 def _b4_pre(phi, x, bias, kernel, launch):
-    partial = bias.new_empty((40, 16, 32))
-    squares = bias.new_empty((40, 16, 8))
-    scratch = bias.new_empty((4, 24))
-    residual = x.new_empty((4, 4, 2560))
-    layer = x.new_empty((4, 2560))
-    weights = bias.new_empty((4, 4))
+    if _USE_CPP_PRE_ALLOCATOR:
+        partial, squares, scratch, residual, layer, weights = _b4_pre_allocator(x.device)()
+    else:
+        partial = bias.new_empty((40, 16, 32))
+        squares = bias.new_empty((40, 16, 8))
+        scratch = bias.new_empty((4, 24))
+        residual = x.new_empty((4, 4, 2560))
+        layer = x.new_empty((4, 2560))
+        weights = bias.new_empty((4, 4))
     if launch is _run_kernel:
         _b4_launcher(kernel, x.device)(
             x, phi, partial, squares, partial, squares, bias, scratch, weights, residual, layer,
