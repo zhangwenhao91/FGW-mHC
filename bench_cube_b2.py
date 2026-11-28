@@ -11,6 +11,37 @@ from bench_mhc import CASES, time_us
 ROUTES = ("cube", "cube_mk", "cube_full")
 
 
+def prepare_fresh_pair(inputs, layer, projection):
+    """Specialize launch configuration once while allocating independent results per call."""
+    from fgw_mhc import mhc_post, mhc_pre
+
+    kernels = {}
+
+    def capture(stage, kernel, *tensors):
+        kernels[stage] = kernel, tensors
+
+    residual, _, weights = mhc_pre(*inputs, projection=projection, _launch=capture)
+    mhc_post(layer, weights, residual, _launch=capture)
+    pre, pre_args = kernels["pre"]
+    post, _ = kernels["post"]
+    partial_shape, squares_shape = tuple(pre_args[2].shape), tuple(pre_args[3].shape)
+    batch, hidden = layer.shape
+
+    def pair(phi, x, bias, layer_out):
+        partial = bias.new_empty(partial_shape)
+        squares = bias.new_empty(squares_shape)
+        workspace = bias.new_empty((batch, 24))
+        residual = x.new_empty((batch, 4, hidden))
+        layer_in = x.new_empty((batch, hidden))
+        weights = bias.new_empty((batch, 4))
+        out = x.new_empty((batch, 4, hidden))
+        pre(x, phi, partial, squares, partial, squares, bias, workspace, weights, residual, layer_in)
+        post(layer_out, weights, residual, out)
+        return residual.flatten(1), layer_in, weights, out.flatten(1)
+
+    return pair
+
+
 def verify_windowed_cache(torch, inputs, layer, source_path, route):
     from fgw_mhc import mhc_post, mhc_pre
     from fgw_mhc.reference import post_reference, pre_reference
@@ -73,6 +104,7 @@ def main():
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
     parser.add_argument("--double-window-stage", action="store_true", help="Compare single- and double-slot guarded window staging")
     parser.add_argument("--guarded-window-cache", action="store_true", help="Compare windowed caching with per-window MTE2 reuse guards")
+    parser.add_argument("--fresh-simd-pairs", action="store_true", help="Compare specialized launches that allocate fresh outputs")
     parser.add_argument("--bound-simd-pairs", action="store_true", help="Compare normal calls with bound kernels and reused outputs")
     parser.add_argument("--profile-simd-pairs", type=Path, help="Capture interleaved SIMD reduction pairs after timing")
     parser.add_argument("--verify-windowed-cache", type=Path, help="Dump device source and stress-test the windowed cache path")
@@ -124,6 +156,8 @@ def main():
         parser.error("--m-only-k-window and --large-post-tiles use batches 1024 and 4096, and other modes use 1, 2, or 4")
     if args.b4_post_tiles and args.batch != 4:
         parser.error("--b4-post-tiles requires --batch 4")
+    if args.fresh_simd_pairs and (not args.simd_reduce or args.bound_simd_pairs or args.profile_simd_pairs):
+        parser.error("--fresh-simd-pairs requires --simd-reduce without binding or profiling")
     if args.bound_simd_pairs and (not args.simd_reduce or args.profile_simd_pairs):
         parser.error("--bound-simd-pairs requires --simd-reduce without profiling")
     if args.profile_simd_pairs and not args.simd_reduce:
@@ -301,6 +335,16 @@ def main():
             return pair
 
         bound_pairs = {f"{route}_bound": bind_pair(route) for route in routes}
+        routes += tuple(bound_pairs)
+
+    if args.fresh_simd_pairs:
+        for route in routes:
+            pair = prepare_fresh_pair(inputs, layer, route)
+            launch = partial(pair, phi, x, bias, layer)
+            first, second = launch(), launch()
+            if any(a.data_ptr() == b.data_ptr() for a, b in zip(first, second, strict=True)):
+                raise RuntimeError(f"{route} reused a live output buffer")
+            bound_pairs[f"{route}_fresh"] = launch
         routes += tuple(bound_pairs)
 
     for route in routes:
