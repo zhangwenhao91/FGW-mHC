@@ -477,8 +477,8 @@ def main():
                     for enabled in allocators.values():
                         fgw_mhc._USE_CPP_PRE_ALLOCATOR = enabled
                         residual, layer_in, post = mhc_pre(*pre_args, projection=route)
-                        output = mhc_post(layer_out, post, residual)
-                        torch.testing.assert_close((residual, layer_in, post, output),
+                        post_output = mhc_post(layer_out, post, residual)
+                        torch.testing.assert_close((residual, layer_in, post, post_output),
                                                    (residual_ref, *expected), atol=0.01, rtol=0.01)
                     candidates = tuple((name, pair) for name in allocators)
                 if args.compare_fresh_b4:
