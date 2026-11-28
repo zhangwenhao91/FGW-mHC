@@ -456,7 +456,7 @@ def project_cube_m_only(
     x, phi, bias, h_post, x_res, x_layer, trace, *,
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
-    projection_only: bool = False,
+    projection_only: bool = False, k_pipeline_stages: int = 1,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     rows = 16
@@ -501,7 +501,7 @@ def project_cube_m_only(
         T.set_hf32_mode("nearest_even")
         for row_tile in T.Persistent([row_tiles], cores, core):
             vector_m = row_tile * rows + side * half
-            for part in T.Pipelined(splits, num_stages=1):
+            for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
                 k = part * chunk
                 # The tail load zero-pads any rows outside the real batch.
                 T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)

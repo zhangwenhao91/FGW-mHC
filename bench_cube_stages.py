@@ -66,13 +66,16 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     post = bias.new_empty((batch, 4))
     weights = bias.new_empty((batch, 24))
     projection = bias.new_empty((batch, 32))
-    if args.projection_k_sweep:
+    if args.projection_k_sweep or args.projection_buffer_sweep:
         flat = x.float()
         expected_projection = flat @ phi
         expected_squares = flat.square().sum(-1)
 
-        def prepare(chunk):
-            kernel = _compile("project_cube_m_only", **(config | {"chunk": chunk}), projection_only=True)
+        def prepare(chunk, stages):
+            kernel = _compile(
+                "project_cube_m_only", **(config | {"chunk": chunk}),
+                projection_only=True, k_pipeline_stages=stages,
+            )
 
             def run():
                 kernel(x, phi, bias, post, residual, layer, projection)
@@ -82,7 +85,10 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
             torch.testing.assert_close(projection[:, 24], expected_squares, atol=0.01, rtol=0.01)
             return run
 
-        variants = tuple((f"projection_k{chunk}", prepare(chunk)) for chunk in (256, 512))
+        if args.projection_buffer_sweep:
+            variants = tuple((f"projection_k512_stages{stages}", prepare(512, stages)) for stages in (1, 2))
+        else:
+            variants = tuple((f"projection_k{chunk}", prepare(chunk, 1)) for chunk in (256, 512))
     else:
         full = _compile("project_cube_m_only", **config)
         project = _compile("project_cube_m_only", **config, projection_only=True)
@@ -114,7 +120,7 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     samples = defaultdict(list)
     count = args.launches_per_event
     orders = tuple(permutations(variants))
-    for order in orders * (2 if args.projection_k_sweep else 1):
+    for order in orders * (2 if len(variants) == 2 else 1):
         for name, run in order:
             def submit():
                 for _ in range(count):
@@ -122,7 +128,7 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
             duration = time_us(submit, torch, args.warmup, args.repeat) / count
             samples[name].append(duration)
-            writer.writerow((batch, hidden, "cube_m_only_k512" if args.ablate_k512 else "cube_m_only", name, f"{duration:.3f}", count, 1, 0.02))
+            writer.writerow((batch, hidden, "cube_m_only_k512" if args.ablate_k512 or args.projection_buffer_sweep else "cube_m_only", name, f"{duration:.3f}", count, 1, 0.02))
     for name, values in samples.items():
         print(f"N={batch} H={hidden} {name}: median {median(values):.3f} us, "
               f"range {min(values):.3f}–{max(values):.3f} us", flush=True)
@@ -133,6 +139,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--simd-reduce", action="store_true", help="Compare baseline and SIMD partial reduction")
     parser.add_argument("--ablate-m-only", action="store_true", help="Compare full Pre, coefficients, and projection at N=1024 and 4096")
+    parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
     parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
@@ -143,6 +150,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.projection_buffer_sweep and (not args.ablate_m_only or args.projection_k_sweep):
+        parser.error("--projection-buffer-sweep requires --ablate-m-only without --projection-k-sweep")
     if args.ablate_k512 and (not args.ablate_m_only or args.projection_k_sweep):
         parser.error("--ablate-k512 requires --ablate-m-only without --projection-k-sweep")
     if args.projection_k_sweep and not args.ablate_m_only:
@@ -165,7 +174,7 @@ def main():
         writer = csv.writer(output)
         writer.writerow(("batch", "hidden", "projection", "stage", "median_us", "launches_per_event", "sinkhorn_iters", "sinkhorn_eps"))
         cases = ((1024, 2560), (4096, 2560)) if args.ablate_m_only else CASES
-        if args.projection_k_sweep:
+        if args.projection_k_sweep or args.projection_buffer_sweep:
             cases = cases[:1]
         for batch, hidden in cases:
             width = 4 * hidden
@@ -177,7 +186,7 @@ def main():
                 continue
             iters, eps = (1, 0.02) if args.tileops_spec or args.ablate_m_only else (20, 1e-6)
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, iters, eps)
-            expected = None if args.projection_k_sweep else pre_reference(*inputs)
+            expected = None if args.projection_k_sweep or args.projection_buffer_sweep else pre_reference(*inputs)
             if args.ablate_m_only:
                 ablate_m_only(writer, torch, args, inputs, expected, batch, hidden)
                 output.flush()
