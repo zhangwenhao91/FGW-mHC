@@ -59,7 +59,7 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
     phi, x, bias = inputs[:3]
     width = 4 * hidden
-    config = dict(batch=batch, width=width, chunk=math.gcd(width, 256), tile=hidden,
+    config = dict(batch=batch, width=width, chunk=512 if args.ablate_k512 else math.gcd(width, 256), tile=hidden,
                   repeat=1, eps=0.02, alpha_pre=1.0, alpha_post=1.0, alpha_res=1.0)
     residual = x.new_empty((batch, 4, hidden))
     layer = x.new_empty((batch, hidden))
@@ -122,7 +122,7 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
             duration = time_us(submit, torch, args.warmup, args.repeat) / count
             samples[name].append(duration)
-            writer.writerow((batch, hidden, "cube_m_only", name, f"{duration:.3f}", count, 1, 0.02))
+            writer.writerow((batch, hidden, "cube_m_only_k512" if args.ablate_k512 else "cube_m_only", name, f"{duration:.3f}", count, 1, 0.02))
     for name, values in samples.items():
         print(f"N={batch} H={hidden} {name}: median {median(values):.3f} us, "
               f"range {min(values):.3f}–{max(values):.3f} us", flush=True)
@@ -134,6 +134,7 @@ def main():
     parser.add_argument("--simd-reduce", action="store_true", help="Compare baseline and SIMD partial reduction")
     parser.add_argument("--ablate-m-only", action="store_true", help="Compare full Pre, coefficients, and projection at N=1024 and 4096")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
+    parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
     parser.add_argument("--launches-per-event", type=int, default=1,
@@ -142,6 +143,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.ablate_k512 and (not args.ablate_m_only or args.projection_k_sweep):
+        parser.error("--ablate-k512 requires --ablate-m-only without --projection-k-sweep")
     if args.projection_k_sweep and not args.ablate_m_only:
         parser.error("--projection-k-sweep requires --ablate-m-only")
     if args.ablate_m_only and (args.batch is not None or args.simd_reduce):

@@ -12,7 +12,8 @@ case "${2:-all}" in
     large-pair) modes=(large-full large-m-only); projection=cube_full; label=tileops-spec ;;
     large-stages) modes=(large-stages); projection=cube_m_only; label=tileops-spec ;;
     large-k512-pair) modes=(large-k512-pair); projection=cube_m_only_k512; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair]" >&2; exit 2 ;;
+    large-k512-stages) modes=(large-k512-stages); projection=cube_m_only_k512; label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -24,7 +25,7 @@ done
 
 for mode in "${modes[@]}"; do
     stage_args=()
-    if [[ "$mode" == stages || "$mode" == large-stages ]]; then
+    if [[ "$mode" == stages || "$mode" == large-stages || "$mode" == large-k512-stages ]]; then
         stage_args=(--split-stages)
     fi
     prefix="$label-$mode-card$card"
@@ -34,7 +35,7 @@ for mode in "${modes[@]}"; do
     fi
     merge_args=()
     baseline="$prefix-vllm.csv"
-    if [[ "$mode" == large-k512-pair ]]; then
+    if [[ "$mode" == large-k512-* ]]; then
         common+=(--large-k512-cases --pairs-per-event 8)
         merge_args+=(--large-k512-cases)
     elif [[ "$mode" == large-* ]]; then

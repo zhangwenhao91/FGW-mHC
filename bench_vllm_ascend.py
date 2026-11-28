@@ -50,7 +50,7 @@ def merge_results(tilelang_path, vllm_path, output_path, cases=CASES):
         writer = csv.writer(output)
         split = any(key[-1] != "pair" for key in tilelang)
         show_count = any(key[-2] != 1 for key in tilelang)
-        count_columns = ("pairs_per_event",) if show_count else ()
+        count_columns = (("calls_per_event" if split else "pairs_per_event"),) if show_count else ()
         stage_columns = ("stage",) if split else ()
         metric = "stage" if split else "pair"
         writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "sinkhorn_eps", *count_columns, *stage_columns,
@@ -169,9 +169,9 @@ def main():
     else:
         cases = LARGE_TOKEN_CASES if args.large_tokens else CASES
     if args.pairs_per_event < 1 or (args.pairs_per_event > 1 and (
-        args.merge or args.backend == "both" or args.split_stages or args.profile_dir or args.sweep_pairs
+        args.merge or args.backend == "both" or args.profile_dir or args.sweep_pairs
     )):
-        parser.error("--pairs-per-event must be positive and requires single-backend pair timing when greater than 1")
+        parser.error("--pairs-per-event must be positive and requires single-backend timing when greater than 1")
     if args.large_tokens and (args.batch is not None or args.profile_batch is not None):
         parser.error("--large-tokens cannot be used with the small-case batch filters")
     if args.tileops_spec:
@@ -237,7 +237,7 @@ def main():
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "projection",
                              "pairs_per_event", "order", "pair_us"))
         elif args.split_stages:
-            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "stage", "stage_us", "sinkhorn_eps"))
+            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "stage", "stage_us", "sinkhorn_eps", "pairs_per_event"))
         elif args.backend != "both":
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "pair_us", "sinkhorn_eps", "pairs_per_event"))
         else:
@@ -318,12 +318,18 @@ def main():
 
                 # The Post inputs stay resident and are prepared before the timed trials.
                 for stage, op in (("pre", pre_op), ("post", post_op)):
-                    latency = time_us(op, torch, args.warmup, args.repeat)
+                    def submit_stage():
+                        for _ in range(args.pairs_per_event - 1):
+                            op()
+                        return op()
+
+                    submit = op if args.pairs_per_event == 1 else submit_stage
+                    latency = time_us(submit, torch, args.warmup, args.repeat) / args.pairs_per_event
                     if not math.isfinite(latency) or latency <= 0:
                         raise RuntimeError(f"Invalid {stage} event time for B={batch}, hidden={hidden}")
                     projection = projection_label if args.backend == "tilelang" else ""
                     writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
-                                     args.warmup, args.repeat, projection, stage, f"{latency:.6f}", eps))
+                                     args.warmup, args.repeat, projection, stage, f"{latency:.6f}", eps, args.pairs_per_event))
                     output.flush()
                     print(f"{args.backend} {stage} B={batch} hidden={hidden}: {latency:.3f} us", flush=True)
                 continue
