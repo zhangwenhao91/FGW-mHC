@@ -104,18 +104,18 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     post = bias.new_empty((batch, 4))
     weights = bias.new_empty((batch, 24))
     projection = bias.new_empty((batch, 32))
-    if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection:
+    if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection or args.projection_m_tile_sweep:
         flat = x.float()
         expected_projection = flat @ phi
         expected_squares = flat.square().sum(-1)
 
         sources = {}
 
-        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False):
+        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
                 projection_only=True, k_pipeline_stages=stages, a_ping_pong=a_ping_pong,
-                compute_squares=compute_squares, accumulate_squares=accumulate_squares,
+                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows,
             )
 
             if args.dump_projection_code is not None:
@@ -141,7 +141,12 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 )
             return run
 
-        if args.profile_projection:
+        if args.projection_m_tile_sweep:
+            variants = (
+                ("projection_m16_k512", prepare(512, 2, accumulate_squares=True)),
+                ("projection_m256_k128", prepare(128, 2, accumulate_squares=True, rows=256)),
+            )
+        elif args.profile_projection:
             if args.deferred_buffer_sweep:
                 variants = tuple(
                     (f"projection_k512_deferred_stages{stages}", prepare(512, stages, accumulate_squares=True))
@@ -247,6 +252,7 @@ def main():
     parser.add_argument("--projection-a-ping-pong", action="store_true", help="Add an explicit two-slot activation L1 variant")
     parser.add_argument("--dump-projection-code", type=Path, help="Save the device sources and diff for the buffer sweep")
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
+    parser.add_argument("--projection-m-tile-sweep", action="store_true", help="Compare M16/K512 and M256/K128 at N=4096")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
     parser.add_argument("--batch-coefficients", action="store_true", help="Compare per-token and batched SIMT coefficient generation")
     parser.add_argument("--ablate-deferred-s2", action="store_true", help="Ablate the two-stage deferred K512 Pre")
@@ -289,6 +295,11 @@ def main():
         parser.error("--ablate-deferred-s2 requires --ablate-k512 without a projection profile or sweep")
     if args.ablate_k512 and (not args.ablate_m_only or args.projection_k_sweep):
         parser.error("--ablate-k512 requires --ablate-m-only without --projection-k-sweep")
+    if args.projection_m_tile_sweep and (
+        not args.ablate_m_only or args.projection_k_sweep or args.projection_buffer_sweep
+        or args.profile_projection or args.ablate_k512
+    ):
+        parser.error("--projection-m-tile-sweep requires --ablate-m-only without other ablation options")
     if args.projection_k_sweep and not args.ablate_m_only:
         parser.error("--projection-k-sweep requires --ablate-m-only")
     if args.ablate_m_only and (args.batch is not None or args.simd_reduce):
@@ -311,6 +322,8 @@ def main():
         cases = ((1024, 2560), (4096, 2560)) if args.ablate_m_only else CASES
         if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection:
             cases = cases[:1]
+        if args.projection_m_tile_sweep:
+            cases = cases[-1:]
         for batch, hidden in cases:
             width = 4 * hidden
             x = torch.randn(batch, width, generator=rng).to(device, torch.bfloat16)
@@ -321,7 +334,7 @@ def main():
                 continue
             iters, eps = (1, 0.02) if args.tileops_spec or args.ablate_m_only else (20, 1e-6)
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, iters, eps)
-            expected = None if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection else pre_reference(*inputs)
+            expected = None if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection or args.projection_m_tile_sweep else pre_reference(*inputs)
             if args.ablate_m_only:
                 ablate_m_only(writer, torch, args, inputs, expected, batch, hidden)
                 output.flush()
