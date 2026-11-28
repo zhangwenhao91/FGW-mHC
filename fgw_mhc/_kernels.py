@@ -99,13 +99,19 @@ def project_cube(x, phi, partial, *, batch: int, width: int, chunk: int):
 
 
 @T.macro
-def _apply_weights(x_ub, weights_ub, res_ub, layer_ub, tile, weight_stride, weight_offset=0):
+def _apply_weights(x_ub, weights_ub, res_ub, layer_ub, tile, weight_stride, weight_offset=0, cached_input=False, token_row=0, hidden=0, column_offset=0):
     with T.SimdVF():
         for chunk in T.serial(tile // 64):
             col = chunk * 64
             streams = S.alloc_local((4,), T.float32)
             for i in T.unroll(4, explicit=True):
-                streams[i] = S.vcvt(S.vld(x_ub[i, col], dist="UNPK_B16"), T.float32, part=0)
+                if cached_input:
+                    streams[i] = S.vcvt(
+                        S.vld(x_ub[token_row, i * hidden + column_offset + col], dist="UNPK_B16"),
+                        T.float32, part=0,
+                    )
+                else:
+                    streams[i] = S.vcvt(S.vld(x_ub[i, col], dist="UNPK_B16"), T.float32, part=0)
             acc = S.alloc_local((1,), T.float32)
             acc[0] = S.vmul(streams[0], S.vld(weights_ub[weight_offset], dist="BRC_B32"))
             for i in T.unroll(1, 4, explicit=True):
@@ -464,11 +470,12 @@ def project_cube_fused(
 @T.macro
 def _m_only_k_window(
     x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, k_base=0,
+    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, k_base=0,
 ):
     k = k_base + part * chunk
     # The tail load zero-pads any rows outside the real batch.
-    T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
+    if not cached_input:
+        T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
     if weight_nk:
         T.copy(phi[0:cols, k:k + chunk], b_l1)
     else:
@@ -489,7 +496,7 @@ def _m_only_k_window(
                         squared[0] = S.vld(squares_ub[0, row, 0])
             for col_tile in T.unroll(chunk // 64, explicit=True):
                 col = col_tile * 64
-                values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
+                values = S.vcvt(S.vld(x_ub[row, k + col if cached_input else col], dist="UNPK_B16"), T.float32, part=0)
                 if separate_nz:
                     S.vsts(cast_ub[row, col], values, full)
                 else:
@@ -582,9 +589,12 @@ def project_cube_m_only(
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
     projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False, compute_squares: bool = True,
-    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0, split_k: int = 0, separate_nz: bool = False, block_nz: bool = False, weight_nk: bool = False, l0_ping_pong: bool = False,
+    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0, split_k: int = 0, separate_nz: bool = False, block_nz: bool = False, weight_nk: bool = False, l0_ping_pong: bool = False, cached_input: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
+    assert not cached_input or (
+        batch_coefficients and not coefficients_only and rows == 16 and width == 10240 and batch % rows == 0
+    )
     assert not block_nz or (separate_nz and rows == 16 and batch % rows == 0)
     assert not separate_nz or (projection_only and accumulate_squares and not split_k)
     assert not batch_coefficients or (accumulate_squares and not debug and not projection_only)
@@ -621,7 +631,7 @@ def project_cube_m_only(
     x_layer: T.Tensor[(batch, hidden), T.bfloat16]
 
     with T.MixedKernel(cores) as (core, side):
-        x_ub = T.alloc_shared((half, chunk), T.bfloat16)
+        x_ub = T.alloc_shared((half, width if cached_input else chunk), T.bfloat16)
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         cast_ub = T.alloc_shared((half, chunk + (8 if block_nz else 0)), T.float32) if separate_nz else nz_ub
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
@@ -656,6 +666,8 @@ def project_cube_m_only(
         for job in T.Persistent([jobs], cores, core):
             shard = job // row_tiles
             vector_m = job % row_tiles * rows + side * half
+            if cached_input:
+                T.copy(x[vector_m:vector_m + half, :], x_ub)
             if split_k:
                 k_base = shard * split_k
                 window_count = T.min(splits, (width - k_base) // chunk)
@@ -663,24 +675,24 @@ def project_cube_m_only(
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
                         vector_m, part, batch, half, cols, chunk, mad_k, window_count,
-                        compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, k_base,
+                        compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, k_base,
                     )
             elif a_ping_pong:
                 # Each call names its own A buffer so the scheduler can track slot reuse.
                 for window_pair in T.Pipelined(splits // 2, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0,
+                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input,
                     )
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_next_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0,
+                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input,
                     )
             else:
                 for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0,
+                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input,
                     )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
@@ -709,8 +721,12 @@ def project_cube_m_only(
                     else:
                         for column_tile in T.serial(hidden // tile):
                             offset = column_tile * tile
-                            T.copy(streams[token, 0, offset], streams_ub)
-                            _apply_weights(streams_ub, row_weights, res_ub, layer_ub, tile, 4, row * 24)
+                            if cached_input:
+                                _apply_weights(x_ub, row_weights, res_ub, layer_ub, tile, 4, row * 24,
+                                               True, row, hidden, offset)
+                            else:
+                                T.copy(streams[token, 0, offset], streams_ub)
+                                _apply_weights(streams_ub, row_weights, res_ub, layer_ub, tile, 4, row * 24)
                             T.copy(res_ub, x_res[token, 0, offset])
                             T.copy(layer_ub, x_layer[token, offset])
                     T.copy(row_post[row * 8:row * 8 + 4], h_post[token, 0:4])
