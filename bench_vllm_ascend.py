@@ -34,7 +34,7 @@ def merge_results(tilelang_path, vllm_path, output_path, cases=CASES):
             if not math.isfinite(latency) or latency <= 0:
                 raise ValueError(f"Invalid median latency in {path}: {row}")
             key = tuple(int(row[field]) for field in ("batch", "hidden", "sinkhorn_iters", "warmup", "repeat"))
-            key = (*key, float(row.get("sinkhorn_eps", 1e-6)), stage)
+            key = (*key, float(row.get("sinkhorn_eps", 1e-6)), int(row.get("pairs_per_event", 1)), stage)
             table[key] = latency
             if backend == "tilelang":
                 route = row.get("projection", "vector")
@@ -49,13 +49,15 @@ def merge_results(tilelang_path, vllm_path, output_path, cases=CASES):
     with output_path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
         split = any(key[-1] != "pair" for key in tilelang)
+        show_count = any(key[-2] != 1 for key in tilelang)
+        count_columns = ("pairs_per_event",) if show_count else ()
         stage_columns = ("stage",) if split else ()
         metric = "stage" if split else "pair"
-        writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "sinkhorn_eps", *stage_columns,
+        writer.writerow(("batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "sinkhorn_eps", *count_columns, *stage_columns,
                          "tilelang_projection", f"tilelang_{metric}_us", f"vllm_ascendc_{metric}_us",
                          "vllm_over_tilelang_speedup"))
         for key, latency in tilelang.items():
-            fields = key if split else key[:-1]
+            fields = (*key[:-2], *((key[-2],) if show_count else ()), *((key[-1],) if split else ()))
             writer.writerow((*fields, projections[key], f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
 
 
@@ -141,7 +143,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--repeat", type=int, default=100)
-    parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "tileops_tuned"), default="cube")
+    parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_m_only_k512", "tileops_tuned"), default="cube")
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
     parser.add_argument("--sweep-pairs", type=int, nargs="+", metavar="PAIRS",
@@ -153,13 +155,23 @@ def main():
     parser.add_argument("--profile-batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--profile-steps", type=int, default=12)
     parser.add_argument("--large-tokens", action="store_true", help="Measure 256, 1024, and 4096 tokens at H=2560")
+    parser.add_argument("--large-k512-cases", action="store_true", help="Use the 1024 and 4096 token K512 workloads")
+    parser.add_argument("--pairs-per-event", type=int, default=1)
     parser.add_argument("--list-cases", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--backend", choices=("both", "tilelang", "vllm"), default="both")
     mode.add_argument("--merge", type=Path, nargs=2, metavar=("TILELANG_CSV", "VLLM_CSV"))
     parser.add_argument("--tileops-spec", action="store_true", help="Use TileOPs mHC manifest Sinkhorn settings")
     args = parser.parse_args()
-    cases = LARGE_TOKEN_CASES if args.large_tokens else CASES
+    if args.large_k512_cases:
+        args.large_tokens = True
+        cases = LARGE_TOKEN_CASES[1:]
+    else:
+        cases = LARGE_TOKEN_CASES if args.large_tokens else CASES
+    if args.pairs_per_event < 1 or (args.pairs_per_event > 1 and (
+        args.merge or args.backend == "both" or args.split_stages or args.profile_dir or args.sweep_pairs
+    )):
+        parser.error("--pairs-per-event must be positive and requires single-backend pair timing when greater than 1")
     if args.large_tokens and (args.batch is not None or args.profile_batch is not None):
         parser.error("--large-tokens cannot be used with the small-case batch filters")
     if args.tileops_spec:
@@ -227,7 +239,7 @@ def main():
         elif args.split_stages:
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "stage", "stage_us", "sinkhorn_eps"))
         elif args.backend != "both":
-            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "pair_us", "sinkhorn_eps"))
+            writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "warmup", "repeat", "projection", "pair_us", "sinkhorn_eps", "pairs_per_event"))
         else:
             writer.writerow((
                 "batch", "hidden", "sinkhorn_iters", "tilelang_projection", "tilelang_pair_us", "vllm_ascendc_pair_us",
@@ -398,11 +410,17 @@ def main():
 
             if args.backend != "both":
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
-                latency = time_us(pair, torch, args.warmup, args.repeat)
+                def submit_pairs():
+                    for _ in range(args.pairs_per_event - 1):
+                        pair()
+                    return pair()
+
+                submit = pair if args.pairs_per_event == 1 else submit_pairs
+                latency = time_us(submit, torch, args.warmup, args.repeat) / args.pairs_per_event
                 if not math.isfinite(latency) or latency <= 0:
                     raise RuntimeError(f"Invalid event time for B={batch}, hidden={hidden}")
                 writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
-                                 args.warmup, args.repeat, projection_label if args.backend == "tilelang" else "", f"{latency:.6f}", eps))
+                                 args.warmup, args.repeat, projection_label if args.backend == "tilelang" else "", f"{latency:.6f}", eps, args.pairs_per_event))
                 output.flush()
                 print(f"{args.backend} B={batch} hidden={hidden}: {latency:.3f} us", flush=True)
                 continue
