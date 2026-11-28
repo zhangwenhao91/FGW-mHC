@@ -182,6 +182,8 @@ def main():
                         help="Limit the event batch-size sweep to one workload")
     parser.add_argument("--compare-fresh-b4", action="store_true",
                         help="Interleave the regular and fresh-output B4 TileLang paths in the sweep")
+    parser.add_argument("--compare-direct-b4", action="store_true",
+                        help="Include fresh outputs with the exported TileLang launchers")
     parser.add_argument("--split-stages", action="store_true", help="Measure each backend’s native Pre and Post separately")
     parser.add_argument("--profile-dir", type=Path, help="Capture consecutive pair launches with the NPU profiler")
     parser.add_argument("--profile-batch", type=int)
@@ -230,6 +232,8 @@ def main():
         parser.error("--sweep-pairs requires a single backend and unprofiled pair execution")
     if args.sweep_pairs is not None and min(args.sweep_pairs) < 1:
         parser.error("pair counts must be positive")
+    if args.compare_direct_b4 and not args.compare_fresh_b4:
+        parser.error("--compare-direct-b4 requires --compare-fresh-b4")
     if args.compare_fresh_b4 and (
         args.backend != "tilelang" or args.batch != 4 or not args.sweep_pairs
         or args.projection != "cube_full" or args.full_h_double_post
@@ -432,14 +436,23 @@ def main():
                 if args.compare_fresh_b4:
                     from bench_cube_b2 import prepare_fresh_pair
 
-                    fresh = prepare_fresh_pair(pre_args, layer_out, route)
+                    def prepare_pair(direct_launch):
+                        fresh = prepare_fresh_pair(pre_args, layer_out, route, direct_launch=direct_launch)
 
-                    def fresh_pair():
-                        _, layer_in, post, output = fresh(phi, x, bias, layer_out)
-                        return layer_in, post, output
+                        def run():
+                            _, layer_in, post, output = fresh(phi, x, bias, layer_out)
+                            return layer_in, post, output
 
-                    torch.testing.assert_close(fresh_pair(), expected, atol=0.01, rtol=0.01)
-                    candidates += (("cube_full_fresh", fresh_pair),)
+                        actual = fresh(phi, x, bias, layer_out)
+                        torch.testing.assert_close(actual, (residual_ref, *expected), atol=0.01, rtol=0.01)
+                        next_outputs = fresh(phi, x, bias, layer_out)
+                        if any(a.data_ptr() == b.data_ptr() for a, b in zip(actual, next_outputs, strict=True)):
+                            raise RuntimeError("Fresh pair reused a live output buffer")
+                        return run
+
+                    candidates += (("cube_full_fresh", prepare_pair(False)),)
+                    if args.compare_direct_b4:
+                        candidates += (("cube_full_fresh_direct", prepare_pair(True)),)
 
                 sizes = tuple(dict.fromkeys(args.sweep_pairs))
                 for order, counts, paths in (("forward", sizes, candidates),

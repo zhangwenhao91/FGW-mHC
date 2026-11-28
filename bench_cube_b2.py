@@ -11,7 +11,7 @@ from bench_mhc import CASES, time_us
 ROUTES = ("cube", "cube_mk", "cube_full")
 
 
-def prepare_fresh_pair(inputs, layer, projection):
+def prepare_fresh_pair(inputs, layer, projection, *, direct_launch=False):
     """Specialize launch configuration once while allocating independent results per call."""
     from fgw_mhc import mhc_post, mhc_pre
 
@@ -25,6 +25,12 @@ def prepare_fresh_pair(inputs, layer, projection):
     pre, pre_args = kernels["pre"]
     post, _ = kernels["post"]
     partial_shape, squares_shape = tuple(pre_args[2].shape), tuple(pre_args[3].shape)
+    if direct_launch:
+        def export(kernel):
+            kernel.adapter._prepare_torch_device(layer.device)
+            return kernel.adapter.get_exportable_executable()["main"]
+
+        pre, post = export(pre), export(post)
     batch, hidden = layer.shape
 
     def pair(phi, x, bias, layer_out):

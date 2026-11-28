@@ -10,6 +10,7 @@ case "${2:-all}" in
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
     validate-b4) modes=(1 2 3 4); projection=cube_full; label="tileops-spec-validate-b4-card$card-$(date +%Y%m%d-%H%M%S)-$$" ;;
+    direct-b4) modes=(sweep); projection=cube_full; label=tileops-spec-direct-b4 ;;
     compare-b4) modes=(sweep); projection=cube_full; label=tileops-spec-compare-b4 ;;
     large-pair) modes=(large-full large-m-only); projection=cube_full; label=tileops-spec ;;
     large-stages) modes=(large-stages); projection=cube_m_only; label=tileops-spec ;;
@@ -22,7 +23,7 @@ case "${2:-all}" in
     tiling-large) modes=(tiling); label=tileops-spec ;;
     large-k512-post-double) modes=(large-k512-post-double); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     profile-n4096-post-double) modes=(large-k512-post-double-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|compare-b4|validate-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|compare-b4|direct-b4|validate-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -65,8 +66,11 @@ for mode in "${modes[@]}"; do
         fi
     fi
     tilelang_args=()
-    if [[ "${2:-all}" == compare-b4 ]]; then
+    if [[ "${2:-all}" == compare-b4 || "${2:-all}" == direct-b4 ]]; then
         tilelang_args+=(--compare-fresh-b4)
+        if [[ "${2:-all}" == direct-b4 ]]; then
+            tilelang_args+=(--compare-direct-b4)
+        fi
     fi
     if [[ "$mode" == large-k512-post-double || "$mode" == large-k512-post-double-profile ]]; then
         common+=(--n4096-only)
@@ -146,7 +150,7 @@ for mode in "${modes[@]}"; do
     fi
     if [[ "$mode" == sweep ]]; then
         cat "$prefix-tilelang.csv" "$prefix-vllm.csv"
-        if [[ "${2:-all}" == compare-b4 ]]; then
+        if [[ "${2:-all}" == compare-b4 || "${2:-all}" == direct-b4 ]]; then
             python - "$prefix-tilelang.csv" "$prefix-vllm.csv" <<'PY'
 import csv
 from statistics import mean
@@ -160,9 +164,12 @@ def times(path):
 fgw, vllm = map(times, sys.argv[1:])
 orders = ("forward", "reverse")
 baseline = mean(vllm["", order] for order in orders)
-for name in ("cube_full", "cube_full_fresh"):
+for name in dict.fromkeys(name for name, _ in fgw):
     latency = mean(fgw[name, order] for order in orders)
     print(f"{name}: {latency:.3f} us/pair, vLLM {baseline:.3f} us/pair, {baseline / latency:.3f}x")
+if ("cube_full_fresh_direct", "forward") in fgw:
+    saved = mean(fgw["cube_full_fresh", order] - fgw["cube_full_fresh_direct", order] for order in orders)
+    print(f"Direct launcher delta: {saved:+.3f} us/pair saved at 32 pairs/event")
 PY
         fi
         continue
