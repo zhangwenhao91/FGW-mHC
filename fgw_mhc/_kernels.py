@@ -464,7 +464,7 @@ def project_cube_fused(
 @T.macro
 def _m_only_k_window(
     x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, rows, mad_m,
+    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
 ):
     k = part * chunk
     # The tail load zero-pads any rows outside the real batch.
@@ -506,18 +506,7 @@ def _m_only_k_window(
                     S.vsstb(zero, ptr, nz_stride, full)
     # Both Vector halves publish their rows to the same Cube L1 tile.
     T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
-    if rows != mad_m:
-        # Reuse B in L0B across every M subtile in this K window.
-        T.copy(b_l1, b_l0, transpose=True)
-        for m_block in T.serial(rows // mad_m):
-            start = m_block * mad_m
-            T.copy(a_l1[start:start + mad_m, :], a_l0)
-            T.gemm(
-                a_l0, b_l0, acc[start:start + mad_m, :], transpose_B=True,
-                clear_accum=part == 0,
-                unit_flag_ctrl=T.Select(part == splits - 1, 3, 2),
-            )
-    elif chunk == mad_k:
+    if chunk == mad_k:
         T.copy(a_l1, a_l0)
         T.copy(b_l1, b_l0, transpose=True)
         # Keep L0C live through intermediate MADs and release it for the final Fixpipe copy.
@@ -550,12 +539,13 @@ def project_cube_m_only(
     assert projection_only or compute_squares
     assert not accumulate_squares or (compute_squares and not a_ping_pong and k_pipeline_stages in (1, 2))
     assert rows == 16 or (rows == 256 and chunk == 128 and projection_only)
-    mad_m = min(rows, 64)
     half = rows // 2
     cols = 32
     splits = width // chunk
     assert not a_ping_pong or splits % 2 == 0
-    mad_k = min(chunk, 256)
+    # L0C requires a zero-origin region. Bound L0A by splitting K, not M,
+    # so the full M tile can accumulate into one compact L0C tile.
+    mad_k = min(chunk, 64 if rows == 256 else 256)
     row_tiles = (batch + rows - 1) // rows
     cores = min(row_tiles, 28)
     x: T.Tensor[(batch, width), T.bfloat16]
@@ -577,7 +567,7 @@ def project_cube_m_only(
         if a_ping_pong:
             a_next_l1 = T.alloc_l1((rows, chunk), T.float32)
         b_l1 = T.alloc_l1((chunk, cols), T.float32)
-        a_l0 = T.alloc_l0a((mad_m, mad_k), T.float32)
+        a_l0 = T.alloc_l0a((rows, mad_k), T.float32)
         b_l0 = T.alloc_l0b((cols, mad_k), T.float32)
         acc = T.alloc_l0c((rows, cols), T.float32)
 
@@ -605,17 +595,17 @@ def project_cube_m_only(
                 for window_pair in T.Pipelined(splits // 2, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, rows, mad_m,
+                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
                     )
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_next_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, rows, mad_m,
+                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
                     )
             else:
                 for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, rows, mad_m,
+                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
                     )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
