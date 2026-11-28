@@ -9,6 +9,7 @@ case "${2:-all}" in
     tuned-pair) modes=(pair); projection=tileops_tuned; label=tileops-spec-tuned ;;
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
+    validate-b4) modes=(1 2 3 4); projection=cube_full; label="tileops-spec-validate-b4-card$card-$(date +%Y%m%d-%H%M%S)-$$" ;;
     compare-b4) modes=(sweep); projection=cube_full; label=tileops-spec-compare-b4 ;;
     large-pair) modes=(large-full large-m-only); projection=cube_full; label=tileops-spec ;;
     large-stages) modes=(large-stages); projection=cube_m_only; label=tileops-spec ;;
@@ -21,7 +22,7 @@ case "${2:-all}" in
     tiling-large) modes=(tiling); label=tileops-spec ;;
     large-k512-post-double) modes=(large-k512-post-double); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     profile-n4096-post-double) modes=(large-k512-post-double-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|compare-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|compare-b4|validate-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -31,12 +32,21 @@ for node in /dev/davinci[0-9]* /dev/hisi_hdc /dev/ummu /dev/uburma; do
     fi
 done
 
+validation_csvs=()
 for mode in "${modes[@]}"; do
+    if [[ "${2:-all}" == validate-b4 ]]; then
+        round="$mode"
+        mode=sweep
+    fi
     stage_args=()
     if [[ "$mode" == stages || "$mode" == large-*-stages || "$mode" == large-stages ]]; then
         stage_args=(--split-stages)
     fi
     prefix="$label-$mode-card$card"
+    if [[ "${2:-all}" == validate-b4 ]]; then
+        prefix="$label-round$round"
+        validation_csvs+=("$prefix-tilelang.csv" "$prefix-vllm.csv")
+    fi
     common=(--tileops-spec --device npu:0 "${stage_args[@]}")
     if [[ "$mode" == sweep ]]; then
         common+=(--batch 4 --sweep-pairs 1 8 32)
@@ -78,9 +88,16 @@ for mode in "${modes[@]}"; do
         tilelang_output=()
         vllm_output=()
     fi
-    if [[ "$mode" != tiling ]]; then
+    run_tilelang() {
         python bench_vllm_ascend.py --backend tilelang --projection "$projection" \
             "${common[@]}" "${tilelang_args[@]}" "${tilelang_output[@]}"
+    }
+    vllm_first=false
+    if [[ "${2:-all}" == validate-b4 ]] && (( round % 2 == 0 )); then
+        vllm_first=true
+    fi
+    if [[ "$mode" != tiling && "$vllm_first" == false ]]; then
+        run_tilelang
     fi
     if [[ "$mode" != large-m-only ]]; then
         cann_env=()
@@ -117,6 +134,9 @@ for mode in "${modes[@]}"; do
         fi
         run_vllm
     fi
+    if [[ "$vllm_first" == true ]]; then
+        run_tilelang
+    fi
     if [[ "$mode" == profile || "$mode" == large-k512-*-profile || "$mode" == large-k512-profile ]]; then
         cat "$profile_dir"/{tilelang,vllm}/"b$profile_batch-h2560"/unprofiled-pair.csv
         if [[ "$mode" == profile ]]; then
@@ -151,3 +171,33 @@ PY
         "${merge_args[@]}" --output "$prefix-results.csv"
     cat "$prefix-results.csv"
 done
+
+if [[ "${2:-all}" == validate-b4 ]]; then
+    python - "${validation_csvs[@]}" <<'PY'
+import csv
+from statistics import mean, median
+import sys
+
+def latencies(path):
+    with open(path, newline="") as source:
+        return {(int(row["pairs_per_event"]), row["order"]): float(row["pair_us"])
+                for row in csv.DictReader(source)}
+
+orders = ("forward", "reverse")
+ratios = {n: [] for n in (1, 8, 32)}
+paths = iter(sys.argv[1:])
+for round_id, (fgw_path, vllm_path) in enumerate(zip(paths, paths, strict=True), start=1):
+    fgw, vllm = latencies(fgw_path), latencies(vllm_path)
+    for count, samples in ratios.items():
+        ours = mean(fgw[count, order] for order in orders)
+        baseline = mean(vllm[count, order] for order in orders)
+        samples.append(baseline / ours)
+        print(f"Round {round_id}, {count} pairs/event: FGW {ours:.3f} us, "
+              f"vLLM {baseline:.3f} us, {samples[-1]:.3f}x")
+
+for count, samples in ratios.items():
+    wins = sum(value > 1 for value in samples)
+    print(f"{count} pairs/event: median {median(samples):.3f}x, "
+          f"range {min(samples):.3f}¨C{max(samples):.3f}x, wins {wins}/{len(samples)}")
+PY
+fi
