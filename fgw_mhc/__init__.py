@@ -9,7 +9,7 @@ __all__ = ["mhc_pre", "mhc_post"]
 
 
 def _check_tensor(name, tensor, shape, dtype, device):
-    if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+    if tensor.shape != shape or tensor.dtype != dtype:
         raise ValueError(f"{name} must have shape {shape} and dtype {dtype}")
     if tensor.device != device or not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous on {device}")
@@ -49,8 +49,11 @@ def _b4_pre(phi, x, bias, kernel, launch):
     residual = x.new_empty((4, 4, 2560))
     layer = x.new_empty((4, 2560))
     weights = bias.new_empty((4, 4))
-    launch("pre", kernel, x, phi, partial, squares, partial, squares,
-           bias, scratch, weights, residual, layer)
+    if launch is _run_kernel:
+        kernel(x, phi, partial, squares, partial, squares, bias, scratch, weights, residual, layer)
+    else:
+        launch("pre", kernel, x, phi, partial, squares, partial, squares,
+               bias, scratch, weights, residual, layer)
     return residual.view(4, 10240), layer, weights
 
 
@@ -65,6 +68,18 @@ def mhc_pre(
     other shapes use the same equations through PyTorch on the NPU.
     """
     batch, width = _check_input(x)
+    if (projection == "cube_full" and batch == 4 and width == 10240
+            and pre_tile is None and phi.shape == (10240, 24)):
+        device = x.device
+        _check_tensor("x", x, (4, 10240), torch.bfloat16, device)
+        _check_tensor("phi", phi, (10240, 24), torch.float32, device)
+        _check_tensor("b", b, (24,), torch.float32, device)
+        if type(sinkhorn_repeat) is not int or sinkhorn_repeat < 0:
+            raise ValueError("sinkhorn_repeat must be a nonnegative integer")
+        kernel = _b4_pre_kernel(float(alpha_pre), float(alpha_post), float(alpha_res),
+                                sinkhorn_repeat, float(sinkhorn_eps))
+        return _b4_pre(phi, x, b, kernel, _launch)
+
     if phi.ndim != 2:
         raise ValueError("phi must be rank 2")
     mixes = phi.shape[1]
@@ -80,11 +95,6 @@ def mhc_pre(
     _check_tensor("x", x, (batch, width), torch.bfloat16, device)
     _check_tensor("phi", phi, (width, mixes), torch.float32, device)
     _check_tensor("b", b, (mixes,), torch.float32, device)
-
-    if projection == "cube_full" and (batch, streams, hidden, pre_tile) == (4, 4, 2560, None):
-        kernel = _b4_pre_kernel(float(alpha_pre), float(alpha_post), float(alpha_res),
-                                sinkhorn_repeat, float(sinkhorn_eps))
-        return _b4_pre(phi, x, b, kernel, _launch)
 
     grouped_routes = {"cube_full_g2": 2, "cube_full_g4": 4}
     if projection not in ("cube", "cube_mk", "cube_full", "cube_full_simd_reduce", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "cube_m_only_k512", "cube_m_only_k512_deferred", "cube_m_only_k512_deferred_s2", "cube_m_only_k512_batched", "cube_m_only_k512_batched_l0", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache", "cube_m_only_k512_guarded_cache", "cube_m_only_k512_double_stage", "cube_split", "vector", *grouped_routes):
@@ -221,6 +231,20 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
     _check_tensor("h_post", h_post, (batch, streams), torch.float32, device)
     _check_tensor("x_res", x_res, (batch, streams * hidden), torch.bfloat16, device)
 
+    if ((batch, streams, hidden) == (4, 4, 2560)
+            and (num_vec_cores, streams_per_task, post_tile, output_cache) == (56, 4, None, "normal_fv")
+            and type(num_vec_cores) is int and type(streams_per_task) is int
+            and type(pipeline_depth) is int and pipeline_depth in (2, 3)
+            and not pipeline):
+        out = x_layer_out.new_empty((4, 4, 2560))
+        kernel = _b4_post_kernel()
+        residual = x_res.view(4, 4, 2560)
+        if _launch is _run_kernel:
+            kernel(x_layer_out, h_post, residual, out)
+        else:
+            _launch("post", kernel, x_layer_out, h_post, residual, out)
+        return out.view(4, 10240)
+
     if type(num_vec_cores) is not int or not 1 <= num_vec_cores <= 56:
         raise ValueError("num_vec_cores must be an integer from 1 to 56")
     if type(streams_per_task) is not int or streams_per_task not in (1, 2, 4):
@@ -231,12 +255,6 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
         raise ValueError("pipeline_depth must be 2 or 3")
     if output_cache not in ("normal_fv", "notalloc_ci"):
         raise ValueError("output_cache must be normal_fv or notalloc_ci")
-    if ((batch, streams, hidden) == (4, 4, 2560)
-            and (num_vec_cores, streams_per_task, post_tile, output_cache) == (56, 4, None, "normal_fv")
-            and not pipeline):
-        out = x_layer_out.new_empty((4, 4, 2560))
-        _launch("post", _b4_post_kernel(), x_layer_out, h_post, x_res.view(4, 4, 2560), out)
-        return out.view(4, 10240)
     out = torch.empty_like(x_res)
     if not out.numel():
         return out
