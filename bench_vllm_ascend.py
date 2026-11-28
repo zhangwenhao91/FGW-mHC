@@ -320,7 +320,27 @@ def main():
                 actual = tilelang_pair()
                 residual_ref, layer_ref, post_ref = pre_reference(*pre_args)
                 expected = (layer_ref, post_ref, post_reference(layer_out, post_ref, residual_ref))
-                torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
+                if args.large_tokens:
+                    residual, layer, post = mhc_pre(*pre_args, projection=route)
+                    for name, observed, target in (
+                        ("pre residual", residual, residual_ref),
+                        ("pre layer", layer, layer_ref),
+                        ("pre post weights", post, post_ref),
+                        ("post with identical inputs", actual[2], post_reference(layer_out, post, residual)),
+                        ("pair output", actual[2], expected[2]),
+                    ):
+                        # The composed BF16 output includes both stages' rounding errors.
+                        atol = 0.02 if name == "pair output" else 0.01
+                        try:
+                            torch.testing.assert_close(observed, target, atol=atol, rtol=0.01)
+                        except AssertionError as exc:
+                            raise AssertionError(
+                                f"{route} N={batch} H={hidden} {name}: {exc}"
+                            ) from exc
+                    pair_error = (actual[2].float() - expected[2].float()).abs().max().item()
+                    print(f"{route} N={batch} H={hidden} pair max abs error: {pair_error:.6g}", flush=True)
+                else:
+                    torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
             if args.backend != "tilelang":
                 try:
                     baseline = vllm_pair()
