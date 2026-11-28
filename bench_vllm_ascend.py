@@ -13,7 +13,10 @@ from statistics import median
 from bench_mhc import CASES, time_us
 
 
-def merge_results(tilelang_path, vllm_path, output_path):
+LARGE_TOKEN_CASES = ((256, 2560), (1024, 2560), (4096, 2560))
+
+
+def merge_results(tilelang_path, vllm_path, output_path, cases=CASES):
     tables = []
     projections = {}
     for path, backend in ((tilelang_path, "tilelang"), (vllm_path, "vllm")):
@@ -22,7 +25,7 @@ def merge_results(tilelang_path, vllm_path, output_path):
         stages = {row.get("stage", "pair") for row in rows}
         if stages not in ({"pair"}, {"pre", "post"}):
             raise ValueError(f"{path} must contain either pair timings or separate pre and post timings")
-        if len(rows) != len(CASES) * len(stages) or any(row["backend"] != backend for row in rows):
+        if len(rows) != len(cases) * len(stages) or any(row["backend"] != backend for row in rows):
             raise ValueError(f"{path} must contain all requested cases for {backend}")
         table = {}
         for row in rows:
@@ -36,7 +39,7 @@ def merge_results(tilelang_path, vllm_path, output_path):
             if backend == "tilelang":
                 route = row.get("projection", "vector")
                 projections[key] = "cube_split" if route == "cube" else route
-        if sorted((key[:2], key[-1]) for key in table) != sorted((shape, stage) for shape in CASES for stage in stages):
+        if sorted((key[:2], key[-1]) for key in table) != sorted((shape, stage) for shape in cases for stage in stages):
             raise ValueError(f"{path} does not contain the requested benchmark shapes")
         tables.append(table)
 
@@ -138,7 +141,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--repeat", type=int, default=100)
-    parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "tileops_tuned"), default="cube")
+    parser.add_argument("--projection", choices=("vector", "cube_split", "cube", "cube_mk", "cube_full", "cube_full_simd", "cube_full_tail", "cube_full_k", "cube_m_only", "tileops_tuned"), default="cube")
     parser.add_argument("--sinkhorn-iters", type=int, default=20)
     parser.add_argument("--output", type=Path, default=Path("vllm-ascend-results.csv"))
     parser.add_argument("--sweep-pairs", type=int, nargs="+", metavar="PAIRS",
@@ -149,12 +152,16 @@ def main():
     parser.add_argument("--profile-dir", type=Path, help="Capture consecutive pair launches with the NPU profiler")
     parser.add_argument("--profile-batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--profile-steps", type=int, default=12)
+    parser.add_argument("--large-tokens", action="store_true", help="Measure 256, 1024, and 4096 tokens at H=2560")
     parser.add_argument("--list-cases", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--backend", choices=("both", "tilelang", "vllm"), default="both")
     mode.add_argument("--merge", type=Path, nargs=2, metavar=("TILELANG_CSV", "VLLM_CSV"))
     parser.add_argument("--tileops-spec", action="store_true", help="Use TileOPs mHC manifest Sinkhorn settings")
     args = parser.parse_args()
+    cases = LARGE_TOKEN_CASES if args.large_tokens else CASES
+    if args.large_tokens and (args.batch is not None or args.profile_batch is not None):
+        parser.error("--large-tokens cannot be used with the small-case batch filters")
     if args.tileops_spec:
         if args.merge or args.backend == "both":
             parser.error("--tileops-spec requires a single backend")
@@ -170,12 +177,12 @@ def main():
     if args.batch is not None and args.sweep_pairs is None:
         parser.error("--batch requires --sweep-pairs")
     if args.merge:
-        merge_results(*args.merge, args.output)
+        merge_results(*args.merge, args.output, cases=cases)
         return
     if args.split_stages and args.backend == "both":
         parser.error("--split-stages requires --backend tilelang or --backend vllm")
     if args.list_cases:
-        for batch, hidden in CASES:
+        for batch, hidden in cases:
             print(f"B={batch} n=4 hidden={hidden}")
         return
     if min(args.warmup, args.repeat, args.sinkhorn_iters, args.profile_steps) < 1:
@@ -228,7 +235,7 @@ def main():
                 "native_pair_output_max_abs_diff",
             ))
         output.flush()
-        for batch, hidden in CASES:
+        for batch, hidden in cases:
             route = args.projection
             if route == "tileops_tuned":
                 route = "cube_m_only" if (batch, hidden) in ((1, 1280), (2, 1920)) else "cube_full"

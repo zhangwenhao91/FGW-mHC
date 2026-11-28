@@ -9,7 +9,8 @@ case "${2:-all}" in
     tuned-pair) modes=(pair); projection=tileops_tuned; label=tileops-spec-tuned ;;
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4]" >&2; exit 2 ;;
+    large-pair) modes=(large-full large-m-only); projection=cube_full; label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -29,6 +30,16 @@ for mode in "${modes[@]}"; do
     if [[ "$mode" == sweep ]]; then
         common+=(--batch 4 --sweep-pairs 1 8 32)
     fi
+    merge_args=()
+    baseline="$prefix-vllm.csv"
+    if [[ "$mode" == large-* ]]; then
+        common+=(--large-tokens)
+        merge_args+=(--large-tokens)
+        baseline="$label-large-full-card$card-vllm.csv"
+        if [[ "$mode" == large-m-only ]]; then
+            projection=cube_m_only
+        fi
+    fi
     tilelang_output=(--output "$prefix-tilelang.csv")
     vllm_output=(--output "$prefix-vllm.csv")
     if [[ "$mode" == profile ]]; then
@@ -39,15 +50,17 @@ for mode in "${modes[@]}"; do
     fi
     python bench_vllm_ascend.py --backend tilelang --projection "$projection" \
         "${common[@]}" "${tilelang_output[@]}"
-    docker run --rm --pull=never --shm-size=1g "${devices[@]}" \
-        -e ASCEND_RT_VISIBLE_DEVICES \
-        -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
-        -v /usr/local/dcmi:/usr/local/dcmi:ro \
-        -v "$(command -v npu-smi):/usr/local/bin/npu-smi:ro" \
-        -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
-        -v "$PWD:/fgw-mhc" -w /fgw-mhc --entrypoint python \
-        quay.io/ascend/vllm-ascend:v0.30.0-a5 bench_vllm_ascend.py \
-        --backend vllm "${common[@]}" "${vllm_output[@]}"
+    if [[ "$mode" != large-m-only ]]; then
+        docker run --rm --pull=never --shm-size=1g "${devices[@]}" \
+            -e ASCEND_RT_VISIBLE_DEVICES \
+            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+            -v /usr/local/dcmi:/usr/local/dcmi:ro \
+            -v "$(command -v npu-smi):/usr/local/bin/npu-smi:ro" \
+            -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
+            -v "$PWD:/fgw-mhc" -w /fgw-mhc --entrypoint python \
+            quay.io/ascend/vllm-ascend:v0.30.0-a5 bench_vllm_ascend.py \
+            --backend vllm "${common[@]}" "${vllm_output[@]}"
+    fi
     if [[ "$mode" == profile ]]; then
         cat "$profile_dir"/{tilelang,vllm}/b4-h2560/unprofiled-pair.csv
         continue
@@ -56,7 +69,7 @@ for mode in "${modes[@]}"; do
         cat "$prefix-tilelang.csv" "$prefix-vllm.csv"
         continue
     fi
-    python bench_vllm_ascend.py --merge "$prefix-tilelang.csv" "$prefix-vllm.csv" \
-        --output "$prefix-results.csv"
+    python bench_vllm_ascend.py --merge "$prefix-tilelang.csv" "$baseline" \
+        "${merge_args[@]}" --output "$prefix-results.csv"
     cat "$prefix-results.csv"
 done
