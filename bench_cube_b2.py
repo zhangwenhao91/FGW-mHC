@@ -16,6 +16,7 @@ def main():
     mode.add_argument("--post-pipeline", action="store_true", help="Compare default, capped, and triple-buffered Post")
     mode.add_argument("--pre-h-tile", action="store_true", help="Compare cube_full Pre output H tiles at B=4")
     mode.add_argument("--grouped-k", action="store_true", help="Compare 1, 2, and 4 K blocks per Cube group")
+    mode.add_argument("--m-only-k-window", action="store_true", help="Compare full M-only Pre at K windows 256 and 512")
     mode.add_argument("--m-only", action="store_true", help="Compare cube_full with M-only Pre")
     mode.add_argument("--split-k", action="store_true", help="Compare cube_full with one split-K job per core")
     mode.add_argument("--tail", action="store_true", help="Compare cube_full with valid-row preparation")
@@ -24,7 +25,7 @@ def main():
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
     parser.add_argument("--pre-only", action="store_true", help="Time Pre without Post")
     parser.add_argument("--post-cores", type=int, choices=range(1, 57), metavar="1..56", default=8)
-    parser.add_argument("--batch", type=int, choices=tuple(batch for batch, _ in CASES), default=2)
+    parser.add_argument("--batch", type=int, choices=(*[batch for batch, _ in CASES], 1024, 4096), default=2)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--cycles", type=int, default=2, help="Repeats of all route orders")
     parser.add_argument("--warmup", type=int, default=30)
@@ -36,12 +37,15 @@ def main():
 
     if args.debug_m_only and not args.m_only:
         parser.error("--debug-m-only requires --m-only")
+    cases = ((1024, 2560), (4096, 2560)) if args.m_only_k_window else CASES
+    if args.batch not in dict(cases):
+        parser.error("--m-only-k-window uses batches 1024 and 4096, and other modes use 1, 2, or 4")
     if args.simd_reduce and args.batch != 4:
         parser.error("--simd-reduce requires --batch 4")
     if args.pre_h_tile and args.batch != 4:
         parser.error("--pre-h-tile requires --batch 4")
-    if args.pre_only and not (args.m_only or args.grouped_k or args.pre_h_tile):
-        parser.error("--pre-only requires --m-only, --grouped-k, or --pre-h-tile")
+    if args.pre_only and not (args.m_only or args.grouped_k or args.pre_h_tile or args.m_only_k_window):
+        parser.error("--pre-only requires --m-only, --m-only-k-window, --grouped-k, or --pre-h-tile")
 
     import torch
     import torch_npu  # noqa: F401
@@ -53,7 +57,7 @@ def main():
     torch.npu.set_device(device)
     rng = torch.Generator().manual_seed(42)
     # Advance the generator exactly as the earlier stages benchmark does.
-    for batch, hidden in CASES:
+    for batch, hidden in cases:
         width = 4 * hidden
         x = torch.randn(batch, width, generator=rng)
         phi = torch.randn(width, 24, generator=rng) / width**0.5
@@ -65,7 +69,7 @@ def main():
     phi = phi.to(device)
     bias = bias.to(device)
     layer = layer.to(device, torch.bfloat16)
-    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile or args.simd_reduce else (20, 1e-6)
+    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile or args.m_only_k_window or args.simd_reduce else (20, 1e-6)
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, *sinkhorn)
 
     if args.debug_m_only:
@@ -125,6 +129,8 @@ def main():
         routes = ("2560", "1280", "640")
     elif args.grouped_k:
         routes = ("cube_full", "cube_full_g2", "cube_full_g4")
+    elif args.m_only_k_window:
+        routes = ("cube_m_only", "cube_m_only_k512")
     elif args.m_only:
         routes = ("cube_full", "cube_m_only")
     elif args.split_k:
@@ -139,13 +145,14 @@ def main():
             (expected,) if args.post_streams else expected,
         ):
             try:
-                torch.testing.assert_close(value, reference, atol=0.01, rtol=0.01)
+                atol = 0.02 if args.m_only_k_window and name == "pair" else 0.01
+                torch.testing.assert_close(value, reference, atol=atol, rtol=0.01)
             except AssertionError as exc:
                 raise AssertionError(f"{route}, B={batch}, H={hidden}, {name}: {exc}") from exc
     torch.npu.synchronize()
 
-    pairs_per_event = 32 if args.simd_reduce else 1
-    if args.simd_reduce:
+    pairs_per_event = 32 if args.simd_reduce else 8 if args.m_only_k_window else 1
+    if pairs_per_event > 1:
         for _ in range(args.warmup):
             for route in routes:
                 run(route)
@@ -160,8 +167,8 @@ def main():
             variant = "pre_h_tile"
         if args.pre_only:
             metric = "pre_us"
-        if args.simd_reduce:
-            metric = "us_per_pair_at_32_pairs_per_event"
+        if pairs_per_event > 1:
+            metric = f"{metric}_at_{pairs_per_event}_per_event" if args.m_only_k_window else "us_per_pair_at_32_pairs_per_event"
         writer.writerow(("batch", "hidden", "cycle", "order", "position", variant, metric))
         for cycle in range(1, args.cycles + 1):
             for order in permutations(routes):
@@ -172,7 +179,7 @@ def main():
                             run(route)
                         return run(route)
 
-                    measure = submit if args.simd_reduce else lambda: run(route)
+                    measure = submit if pairs_per_event > 1 else lambda: run(route)
                     latency = time_us(measure, torch, args.warmup, args.repeat) / pairs_per_event
                     medians[route].append(latency)
                     positions[route][position - 1].append(latency)
