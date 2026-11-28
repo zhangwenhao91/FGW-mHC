@@ -12,6 +12,7 @@ ROUTES = ("cube", "cube_mk", "cube_full")
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--large-post-tiles", action="store_true", help="Compare full-H tiles and double buffering for large-token Post")
     mode.add_argument("--post-streams", action="store_true", help="Time Post only with 1, 2, or 4 streams per task")
     mode.add_argument("--post-pipeline", action="store_true", help="Compare default, capped, and triple-buffered Post")
     mode.add_argument("--pre-h-tile", action="store_true", help="Compare cube_full Pre output H tiles at B=4")
@@ -51,9 +52,9 @@ def main():
         parser.error("--deferred-pipeline requires --m-only-k-window without --deferred-squares")
     if args.deferred_squares and not args.m_only_k_window:
         parser.error("--deferred-squares requires --m-only-k-window")
-    cases = ((1024, 2560), (4096, 2560)) if args.m_only_k_window else CASES
+    cases = ((1024, 2560), (4096, 2560)) if args.m_only_k_window or args.large_post_tiles else CASES
     if args.batch not in dict(cases):
-        parser.error("--m-only-k-window uses batches 1024 and 4096, and other modes use 1, 2, or 4")
+        parser.error("--m-only-k-window and --large-post-tiles use batches 1024 and 4096, and other modes use 1, 2, or 4")
     if args.simd_reduce and args.batch != 4:
         parser.error("--simd-reduce requires --batch 4")
     if args.pre_h_tile and args.batch != 4:
@@ -83,7 +84,7 @@ def main():
     phi = phi.to(device)
     bias = bias.to(device)
     layer = layer.to(device, torch.bfloat16)
-    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile or args.m_only_k_window or args.simd_reduce else (20, 1e-6)
+    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile or args.m_only_k_window or args.large_post_tiles or args.simd_reduce else (20, 1e-6)
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, *sinkhorn)
 
     if args.debug_m_only:
@@ -106,11 +107,23 @@ def main():
         ):
             print(f"{name} actual={actual.tolist()} expected={reference.tolist()}", flush=True)
 
-    if args.post_streams:
+    if args.large_post_tiles:
+        residual, _, weights = mhc_pre(*inputs, projection="cube_m_only_k512_batched")
+        post_inputs = (layer, weights, residual)
+        post_options = {
+            "default": {},
+            "full_h": {"post_tile": hidden},
+            "full_h_double": {"post_tile": hidden, "pipeline": True, "pipeline_depth": 2},
+        }
+    elif args.post_streams:
         weights = torch.randn(batch, 4, generator=rng).to(device)
         post_inputs = (layer, weights, x)
 
+    post_only = args.post_streams or args.large_post_tiles
+
     def run(route):
+        if args.large_post_tiles:
+            return mhc_post(*post_inputs, **post_options[route])
         if args.post_streams:
             return mhc_post(*post_inputs, streams_per_task=int(route))
         projection = "cube_full" if args.post_pipeline or args.pre_h_tile else route
@@ -123,7 +136,7 @@ def main():
             options = {"num_vec_cores": args.post_cores, "pipeline": route == "post_triple"}
         return residual, layer_in, post, mhc_post(layer, post, residual, **options)
 
-    if args.post_streams:
+    if post_only:
         expected = post_reference(*post_inputs)
     else:
         residual, layer_in, post = pre_reference(*inputs)
@@ -131,7 +144,9 @@ def main():
         if not args.pre_only:
             expected += (post_reference(layer, post, residual),)
     routes = ROUTES
-    if args.post_streams:
+    if args.large_post_tiles:
+        routes = tuple(post_options)
+    elif args.post_streams:
         routes = ("1", "2", "4")
     elif args.post_pipeline:
         routes = ("post_default", "post_capped", "post_triple")
@@ -161,10 +176,10 @@ def main():
         routes = ("cube_full", "cube_full_tail")
     for route in routes:
         actual = run(route)
-        names = ("post",) if args.post_streams else ("x_res", "x_layer", "h_post", "pair")
+        names = ("post",) if post_only else ("x_res", "x_layer", "h_post", "pair")
         for name, value, reference in zip(
-            names, (actual,) if args.post_streams else actual,
-            (expected,) if args.post_streams else expected,
+            names, (actual,) if post_only else actual,
+            (expected,) if post_only else expected,
         ):
             try:
                 atol = 0.02 if args.m_only_k_window and name == "pair" else 0.01
@@ -173,7 +188,7 @@ def main():
                 raise AssertionError(f"{route}, B={batch}, H={hidden}, {name}: {exc}") from exc
     torch.npu.synchronize()
 
-    pairs_per_event = 32 if args.simd_reduce else 8 if args.m_only_k_window else 1
+    pairs_per_event = 32 if args.simd_reduce else 8 if args.m_only_k_window or args.large_post_tiles else 1
     if pairs_per_event > 1:
         for _ in range(args.warmup):
             for route in routes:
@@ -187,10 +202,12 @@ def main():
         variant, metric = ("streams_per_task", "post_us") if args.post_streams else ("projection", "pair_us")
         if args.pre_h_tile:
             variant = "pre_h_tile"
+        if args.large_post_tiles:
+            variant, metric = "post_config", "post_us"
         if args.pre_only:
             metric = "pre_us"
         if pairs_per_event > 1:
-            metric = f"{metric}_at_{pairs_per_event}_per_event" if args.m_only_k_window else "us_per_pair_at_32_pairs_per_event"
+            metric = f"{metric}_at_{pairs_per_event}_per_event" if args.m_only_k_window or args.large_post_tiles else "us_per_pair_at_32_pairs_per_event"
         writer.writerow(("batch", "hidden", "cycle", "order", "position", variant, metric))
         for cycle in range(1, args.cycles + 1):
             for order in permutations(routes):

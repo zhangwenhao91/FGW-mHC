@@ -169,7 +169,8 @@ def mhc_pre(
     return x_res, x_layer, h_post
 
 
-def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, streams_per_task=4):
+def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, streams_per_task=4,
+             post_tile=None, pipeline_depth=3):
     """Return the flattened BF16 residual plus the scaled layer output."""
     batch, hidden = _check_input(x_layer_out)
     device = x_layer_out.device
@@ -184,6 +185,10 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
         raise ValueError("num_vec_cores must be an integer from 1 to 56")
     if type(streams_per_task) is not int or streams_per_task not in (1, 2, 4):
         raise ValueError("streams_per_task must be 1, 2, or 4")
+    if post_tile is not None and (type(post_tile) is not int or not 64 <= post_tile <= 4096 or post_tile % 64):
+        raise ValueError("post_tile must be a multiple of 64 between 64 and 4096")
+    if type(pipeline_depth) is not int or pipeline_depth not in (2, 3):
+        raise ValueError("pipeline_depth must be 2 or 3")
     out = torch.empty_like(x_res)
     if not out.numel():
         return out
@@ -191,10 +196,10 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
     token_groups = batch * (streams // group_width)
     tiles_per_group = max(1, num_vec_cores // token_groups)
     alignment = 64 * tiles_per_group
-    tile = min(2048, max(256, ((hidden + alignment - 1) // alignment) * 64))
+    tile = post_tile or min(2048, max(256, ((hidden + alignment - 1) // alignment) * 64))
     jobs = token_groups * ((hidden + tile - 1) // tile)
     cores = min(jobs, num_vec_cores)
-    stages = 3 if pipeline and jobs > cores else 0
+    stages = pipeline_depth if pipeline and jobs > cores else 0
     kernel = _compile(
         "post", batch=batch, hidden=hidden, tile=tile, cores=cores, stages=stages,
         streams=group_width, total_streams=streams,
