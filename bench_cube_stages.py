@@ -97,6 +97,8 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     width = 4 * hidden
     config = dict(batch=batch, width=width, chunk=512 if args.ablate_k512 else math.gcd(width, 256), tile=hidden,
                   repeat=1, eps=0.02, alpha_pre=1.0, alpha_post=1.0, alpha_res=1.0)
+    if args.ablate_deferred_s2:
+        config.update(accumulate_squares=True, k_pipeline_stages=2)
     residual = x.new_empty((batch, 4, hidden))
     layer = x.new_empty((batch, hidden))
     post = bias.new_empty((batch, 4))
@@ -207,7 +209,12 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
             duration = time_us(submit, torch, args.warmup, args.repeat) / count
             samples[name].append(duration)
-            writer.writerow((batch, hidden, "cube_m_only_k512" if args.ablate_k512 or args.projection_buffer_sweep or args.profile_projection else "cube_m_only", name, f"{duration:.3f}", count, 1, 0.02))
+            route = "cube_m_only"
+            if args.ablate_deferred_s2:
+                route = "cube_m_only_k512_deferred_s2"
+            elif args.ablate_k512 or args.projection_buffer_sweep or args.profile_projection:
+                route = "cube_m_only_k512"
+            writer.writerow((batch, hidden, route, name, f"{duration:.3f}", count, 1, 0.02))
     for name, values in samples.items():
         print(f"N={batch} H={hidden} {name}: median {median(values):.3f} us, "
               f"range {min(values):.3f}–{max(values):.3f} us", flush=True)
@@ -229,6 +236,7 @@ def main():
     parser.add_argument("--dump-projection-code", type=Path, help="Save the device sources and diff for the buffer sweep")
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
+    parser.add_argument("--ablate-deferred-s2", action="store_true", help="Ablate the two-stage deferred K512 Pre")
     parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
     parser.add_argument("--accumulate-squares", action="store_true", help="Compare per-window and deferred square reductions")
     parser.add_argument("--compare-squares", action="store_true", help="Also profile projection with squared sum disabled")
@@ -260,6 +268,10 @@ def main():
         parser.error("--deferred-buffer-sweep requires --profile-projection without other square comparisons")
     if args.projection_buffer_sweep and (not args.ablate_m_only or args.projection_k_sweep):
         parser.error("--projection-buffer-sweep requires --ablate-m-only without --projection-k-sweep")
+    if args.ablate_deferred_s2 and (
+        not args.ablate_k512 or args.profile_projection or args.projection_buffer_sweep or args.projection_k_sweep
+    ):
+        parser.error("--ablate-deferred-s2 requires --ablate-k512 without a projection profile or sweep")
     if args.ablate_k512 and (not args.ablate_m_only or args.projection_k_sweep):
         parser.error("--ablate-k512 requires --ablate-m-only without --projection-k-sweep")
     if args.projection_k_sweep and not args.ablate_m_only:
