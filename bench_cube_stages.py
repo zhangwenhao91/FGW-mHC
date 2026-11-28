@@ -181,6 +181,20 @@ def profile_pre_context(writer, torch, args, inputs, layer_out, expected, batch,
     variants = (("standalone_pre", pre), ("continuous_pair", lambda: pair("normal_fv")))
     if args.compare_post_cache:
         variants += (("continuous_pair_notalloc_ci", lambda: pair("notalloc_ci")),)
+    if args.compare_pre_input_reuse:
+        phi, x, bias, *parameters = inputs
+        alternating_inputs = (inputs, (phi, x.clone(), bias, *parameters))
+        next_input = 0
+
+        def alternating_pre():
+            nonlocal next_input
+            result = mhc_pre(*alternating_inputs[next_input], projection="cube_m_only_k512_batched")
+            next_input ^= 1
+            return result
+
+        alternating_pre()
+        torch.testing.assert_close(alternating_pre(), expected, atol=0.01, rtol=0.01)
+        variants += (("alternating_input_pre", alternating_pre),)
     count = args.launches_per_event
     for phase in ("before", "after"):
         if phase == "after":
@@ -451,6 +465,7 @@ def main():
     parser.add_argument("--compare-block-nz", action="store_true", help="Compare fused NZ and vLLM-style block gather")
     parser.add_argument("--compare-separate-nz", action="store_true", help="Compare fused and separate AIV NZ conversion")
     parser.add_argument("--summarize-post-cache", type=Path, help="Read existing Post cache profiling CSVs without an NPU")
+    parser.add_argument("--compare-pre-input-reuse", action="store_true", help="Profile independent Pre while alternating two equal residual buffers")
     parser.add_argument("--compare-post-cache", action="store_true", help="Compare Post L2 store policies in the Pre context profile")
     parser.add_argument("--profile-pre-context", type=Path, help="Compare isolated and paired Pre pipeline utilization at N=4096")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
@@ -468,6 +483,8 @@ def main():
         except (OSError, ValueError, KeyError, ArithmeticError) as exc:
             parser.exit(1, f"Could not summarize Post cache profile: {exc}\n")
         return
+    if args.compare_pre_input_reuse and (not args.profile_pre_context or args.compare_post_cache):
+        parser.error("--compare-pre-input-reuse requires --profile-pre-context without --compare-post-cache")
     if args.compare_post_cache and not args.profile_pre_context:
         parser.error("--compare-post-cache requires --profile-pre-context")
     if args.profile_pre_context and (args.batch is not None or args.ablate_m_only or args.simd_reduce):
