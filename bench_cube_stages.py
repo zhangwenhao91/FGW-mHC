@@ -82,12 +82,60 @@ def profile_projection(run, torch, profiler, directory, warmup, launches):
     if not reports:
         print(f"No pipe metrics CSV recognized under {directory}", flush=True)
     for path in reports:
+        if path.name == "kernel_details.csv":
+            with path.open(newline="", encoding="utf-8-sig") as source:
+                rows = [row for row in csv.DictReader(source) if "project_cube_m_only" in row.get("Name", "")]
+            metrics = ("Duration(us)", "aic_mac_time(us)", "aic_mte1_time(us)", "aic_mte2_time(us)",
+                       "aiv_vec_time(us)", "aiv_mte2_time(us)", "aiv_mte3_time(us)")
+            summaries = []
+            for metric in metrics:
+                values = [float(row[metric]) for row in rows if row.get(metric, "").strip() not in ("", "N/A", "-")]
+                if values:
+                    summaries.append(f"{metric}={median(values):.3f}")
+            if summaries:
+                print(f"{directory.name} Pre device medians ({len(rows)} rows): " + ", ".join(summaries), flush=True)
         print(f"Pipe profiler report: {path}", flush=True)
         with path.open(encoding="utf-8-sig", errors="replace") as source:
             for _ in range(2):
                 line = source.readline()
                 if line:
                     print(line.rstrip(), flush=True)
+
+
+def profile_pre_context(writer, torch, args, inputs, layer_out, expected, batch, hidden):
+    from fgw_mhc import mhc_post, mhc_pre
+    from fgw_mhc.reference import post_reference
+    from torch_npu import profiler
+
+    def pre():
+        return mhc_pre(*inputs, projection="cube_m_only_k512_batched")
+
+    def pair():
+        residual, _, post = pre()
+        return mhc_post(layer_out, post, residual, post_tile=hidden, pipeline=True, pipeline_depth=2)
+
+    residual, layer, post = pre()
+    torch.testing.assert_close((residual, layer, post), expected, atol=0.01, rtol=0.01)
+    torch.testing.assert_close(
+        mhc_post(layer_out, post, residual, post_tile=hidden, pipeline=True, pipeline_depth=2),
+        post_reference(layer_out, post, residual), atol=0.01, rtol=0.01,
+    )
+
+    variants = (("standalone_pre", pre), ("continuous_pair", pair))
+    count = args.launches_per_event
+    for phase in ("before", "after"):
+        if phase == "after":
+            for name, run in variants:
+                profile_projection(run, torch, profiler, args.profile_pre_context / name, args.warmup, max(8, count))
+        for name, run in variants:
+            def submit():
+                for _ in range(count - 1):
+                    run()
+                return run()
+
+            elapsed = time_us(submit, torch, args.warmup, args.repeat) / count
+            writer.writerow((batch, hidden, "cube_m_only_k512_batched", f"{name}_{phase}", f"{elapsed:.3f}", count, 1, 0.02))
+            print(f"N={batch} H={hidden} {name} {phase} profile: {elapsed:.3f} us", flush=True)
 
 
 def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
@@ -340,6 +388,7 @@ def main():
     parser.add_argument("--compare-weight-layout", action="store_true", help="Compare KxN and prepacked NxK projection weights")
     parser.add_argument("--compare-block-nz", action="store_true", help="Compare fused NZ and vLLM-style block gather")
     parser.add_argument("--compare-separate-nz", action="store_true", help="Compare fused and separate AIV NZ conversion")
+    parser.add_argument("--profile-pre-context", type=Path, help="Compare isolated and paired Pre pipeline utilization at N=4096")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
@@ -349,6 +398,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.profile_pre_context and (args.batch is not None or args.ablate_m_only or args.simd_reduce):
+        parser.error("--profile-pre-context selects its own N=4096 workload")
     if args.accumulate_squares and not args.profile_projection:
         parser.error("--accumulate-squares requires --profile-projection")
     if args.compare_squares and not args.profile_projection:
@@ -425,6 +476,8 @@ def main():
             cases = cases[:1]
         if args.projection_m_tile_sweep:
             cases = cases[-1:]
+        if args.profile_pre_context:
+            cases = ((4096, 2560),)
         for batch, hidden in cases:
             width = 4 * hidden
             x = torch.randn(batch, width, generator=rng).to(device, torch.bfloat16)
@@ -433,9 +486,13 @@ def main():
             layer_out = torch.randn(batch, hidden, generator=rng).to(device, torch.bfloat16)
             if args.batch is not None and batch != args.batch:
                 continue
-            iters, eps = (1, 0.02) if args.tileops_spec or args.ablate_m_only else (20, 1e-6)
+            iters, eps = (1, 0.02) if args.tileops_spec or args.ablate_m_only or args.profile_pre_context else (20, 1e-6)
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, iters, eps)
             expected = None if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection or args.projection_m_tile_sweep or args.projection_mk_compare else pre_reference(*inputs)
+            if args.profile_pre_context:
+                profile_pre_context(writer, torch, args, inputs, layer_out, expected, batch, hidden)
+                output.flush()
+                continue
             if args.ablate_m_only:
                 ablate_m_only(writer, torch, args, inputs, expected, batch, hidden)
                 output.flush()
