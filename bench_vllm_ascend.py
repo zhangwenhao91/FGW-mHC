@@ -182,6 +182,8 @@ def main():
                         help="Limit the event batch-size sweep to one workload")
     parser.add_argument("--compare-fresh-b4", action="store_true",
                         help="Interleave the regular and fresh-output B4 TileLang paths in the sweep")
+    parser.add_argument("--compare-tileops-dispatch", action="store_true",
+                        help="Compare TileOPs public calls with its already-selected kernels")
     parser.add_argument("--verify-b4-stream", action="store_true",
                         help="Check the normal B4 calls on a non-default NPU stream before timing")
     parser.add_argument("--allocator-ab-b4", action="store_true",
@@ -260,6 +262,8 @@ def main():
     if args.batch is not None and args.sweep_pairs is None:
         parser.error("--batch requires --sweep-pairs")
     tileops_repo = os.environ.get("FGW_MHC_TILEOPS_REPO") if args.backend == "tilelang" else None
+    if args.compare_tileops_dispatch and not tileops_repo:
+        parser.error("--compare-tileops-dispatch requires FGW_MHC_TILEOPS_REPO")
     if tileops_repo and (not args.verify_b4_stream or args.compare_fresh_b4 or args.allocator_ab_b4):
         parser.error("FGW_MHC_TILEOPS_REPO requires the normal B4 validation sweep")
     if args.merge:
@@ -504,6 +508,16 @@ def main():
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
                 projection = projection_label if args.backend == "tilelang" else ""
                 candidates = ((projection, pair),)
+                if args.compare_tileops_dispatch:
+                    (pre_kernel,) = tileops_pre.iter_kernels()
+                    (post_kernel,) = tileops_post.iter_kernels()
+
+                    def kernel_pair():
+                        residual, layer_in, post = pre_kernel(*pre_args)
+                        return layer_in, post, post_kernel(layer_out, post, residual)
+
+                    torch.testing.assert_close(kernel_pair(), expected, atol=0.01, rtol=0.01)
+                    candidates = (("tileops_public", pair), ("tileops_kernel", kernel_pair))
                 if args.allocator_ab_b4:
                     import fgw_mhc
 
@@ -563,7 +577,7 @@ def main():
                                 writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters, label,
                                                  count, order_label, f"{per_pair:.6f}"))
                                 output.flush()
-                                name = label if args.compare_fresh_b4 or args.allocator_ab_b4 else args.backend
+                                name = label if len(candidates) > 1 else args.backend
                                 print(f"{name} B={batch} H={hidden} {count} pairs/event {order_label}: "
                                       f"{per_pair:.3f} us/pair", flush=True)
                 if args.allocator_ab_b4:

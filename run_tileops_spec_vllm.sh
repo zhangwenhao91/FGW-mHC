@@ -8,6 +8,7 @@ case "${2:-all}" in
     all) modes=(stages pair); projection=cube_full; label=tileops-spec ;;
     tuned-pair) modes=(pair); projection=tileops_tuned; label=tileops-spec-tuned ;;
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
+    tileops-dispatch-b4) modes=(sweep); projection=cube_full; label=tileops-spec-dispatch-b4 ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
     validate-b4) modes=(1 2 3 4); projection=cube_full; label="tileops-spec-validate-b4-card$card-$(date +%Y%m%d-%H%M%S)-$$" ;;
     allocator-ab-b4) modes=(sweep); projection=cube_full; label=tileops-spec-allocator-ab-b4 ;;
@@ -25,7 +26,7 @@ case "${2:-all}" in
     tiling-large) modes=(tiling); label=tileops-spec ;;
     large-k512-post-double) modes=(large-k512-post-double); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     profile-n4096-post-double) modes=(large-k512-post-double-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|compare-b4|direct-b4|allocate-b4|allocator-ab-b4|validate-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|tileops-dispatch-b4|compare-b4|direct-b4|allocate-b4|allocator-ab-b4|validate-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -68,6 +69,9 @@ for mode in "${modes[@]}"; do
         fi
     fi
     tilelang_args=()
+    if [[ "${2:-all}" == tileops-dispatch-b4 ]]; then
+        tilelang_args+=(--verify-b4-stream --compare-tileops-dispatch)
+    fi
     if [[ "${2:-all}" == allocator-ab-b4 ]]; then
         tilelang_args+=(--allocator-ab-b4)
     fi
@@ -185,7 +189,7 @@ for count in (1, 8, 32):
           f"vLLM {baseline:.3f} us")
 PY
         fi
-        if [[ "${2:-all}" == compare-b4 || "${2:-all}" == direct-b4 || "${2:-all}" == allocate-b4 ]]; then
+        if [[ "${2:-all}" == compare-b4 || "${2:-all}" == direct-b4 || "${2:-all}" == allocate-b4 || "${2:-all}" == tileops-dispatch-b4 ]]; then
             python - "$prefix-tilelang.csv" "$prefix-vllm.csv" <<'PY'
 import csv
 from statistics import mean
@@ -202,6 +206,9 @@ baseline = mean(vllm["", order] for order in orders)
 for name in dict.fromkeys(name for name, _ in fgw):
     latency = mean(fgw[name, order] for order in orders)
     print(f"{name}: {latency:.3f} us/pair, vLLM {baseline:.3f} us/pair, {baseline / latency:.3f}x")
+if ("tileops_kernel", "forward") in fgw:
+    delta = mean(fgw["tileops_public", order] - fgw["tileops_kernel", order] for order in orders)
+    print(f"TileOPs public-to-kernel gap: {delta:.3f} us/pair at 32 pairs/event")
 if ("cube_full_fresh_direct", "forward") in fgw:
     saved = mean(fgw["cube_full_fresh", order] - fgw["cube_full_fresh_direct", order] for order in orders)
     print(f"Direct launcher delta: {saved:+.3f} us/pair saved at 32 pairs/event")
