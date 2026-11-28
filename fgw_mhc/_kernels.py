@@ -470,11 +470,13 @@ def project_cube_fused(
 @T.macro
 def _m_only_k_window(
     x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache, k_base=0,
+    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache, guarded_cache, input_stage, k_base=0,
 ):
     k = k_base + part * chunk
     # The tail load zero-pads any rows outside the real batch.
-    if windowed_cache:
+    if guarded_cache:
+        T.copy(x[vector_m:vector_m + half, k:k + chunk], input_stage)
+    elif windowed_cache:
         T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub[:, k:k + chunk])
     elif not cached_input:
         T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
@@ -498,7 +500,13 @@ def _m_only_k_window(
                         squared[0] = S.vld(squares_ub[0, row, 0])
             for col_tile in T.unroll(chunk // 64, explicit=True):
                 col = col_tile * 64
-                values = S.vcvt(S.vld(x_ub[row, k + col if cached_input else col], dist="UNPK_B16"), T.float32, part=0)
+                activation = S.vld(
+                    input_stage[row, col if guarded_cache or not cached_input else k + col], dist="UNPK_B16",
+                )
+                if guarded_cache:
+                    # The same vector read feeds projection and saves the original BF16 lanes.
+                    S.vsts(x_ub[row, k + col], activation, dist="PK_B32")
+                values = S.vcvt(activation, T.float32, part=0)
                 if separate_nz:
                     S.vsts(cast_ub[row, col], values, full)
                 else:
@@ -638,10 +646,7 @@ def project_cube_m_only(
         x_ub = T.alloc_shared((half, width if cached_input else chunk), T.bfloat16)
         if windowed_cache:
             T.annotate_buffer_versions({x_ub: 1})
-        if guarded_cache:
-            # Bind the reverse dependency to AIV residual storage, so Vector
-            # consumption orders the next window's MTE2 publication.
-            T.assume_conflict(x_ub, cross=True)
+        input_stage = T.alloc_shared((half, chunk), T.bfloat16) if guarded_cache else x_ub
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         cast_ub = T.alloc_shared((half, chunk + (8 if block_nz else 0)), T.float32) if separate_nz else nz_ub
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
@@ -685,24 +690,24 @@ def project_cube_m_only(
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
                         vector_m, part, batch, half, cols, chunk, mad_k, window_count,
-                        compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache, k_base,
+                        compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache, guarded_cache, input_stage, k_base,
                     )
             elif a_ping_pong:
                 # Each call names its own A buffer so the scheduler can track slot reuse.
                 for window_pair in T.Pipelined(splits // 2, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache,
+                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache, guarded_cache, input_stage,
                     )
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_next_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache,
+                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache, guarded_cache, input_stage,
                     )
             else:
                 for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache,
+                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, cast_ub, separate_nz, block_nz, weight_nk, l0_ping_pong, a_next_l0, b_next_l0, cached_input, windowed_cache, guarded_cache, input_stage,
                     )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
