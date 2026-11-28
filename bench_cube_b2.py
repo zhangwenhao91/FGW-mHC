@@ -19,6 +19,7 @@ def main():
     mode.add_argument("--m-only", action="store_true", help="Compare cube_full with M-only Pre")
     mode.add_argument("--split-k", action="store_true", help="Compare cube_full with one split-K job per core")
     mode.add_argument("--tail", action="store_true", help="Compare cube_full with valid-row preparation")
+    mode.add_argument("--simd-reduce", action="store_true", help="Compare SIMD partial reduction at 32 pairs per event")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
     parser.add_argument("--pre-only", action="store_true", help="Time Pre without Post")
@@ -35,6 +36,8 @@ def main():
 
     if args.debug_m_only and not args.m_only:
         parser.error("--debug-m-only requires --m-only")
+    if args.simd_reduce and args.batch != 4:
+        parser.error("--simd-reduce requires --batch 4")
     if args.pre_h_tile and args.batch != 4:
         parser.error("--pre-h-tile requires --batch 4")
     if args.pre_only and not (args.m_only or args.grouped_k or args.pre_h_tile):
@@ -62,7 +65,7 @@ def main():
     phi = phi.to(device)
     bias = bias.to(device)
     layer = layer.to(device, torch.bfloat16)
-    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile else (20, 1e-6)
+    sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile or args.simd_reduce else (20, 1e-6)
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, *sinkhorn)
 
     if args.debug_m_only:
@@ -114,6 +117,8 @@ def main():
         routes = ("1", "2", "4")
     elif args.post_pipeline:
         routes = ("post_default", "post_capped", "post_triple")
+    elif args.simd_reduce:
+        routes = ("cube_full", "cube_full_simd_reduce")
     elif args.simd:
         routes = ("cube_full", "cube_full_simd")
     elif args.pre_h_tile:
@@ -139,6 +144,13 @@ def main():
                 raise AssertionError(f"{route}, B={batch}, H={hidden}, {name}: {exc}") from exc
     torch.npu.synchronize()
 
+    pairs_per_event = 32 if args.simd_reduce else 1
+    if args.simd_reduce:
+        for _ in range(args.warmup):
+            for route in routes:
+                run(route)
+        torch.npu.synchronize()
+
     medians = {route: [] for route in routes}
     positions = {route: [[] for _ in routes] for route in routes}
     with open(args.output, "w", encoding="utf-8", newline="") as output:
@@ -148,12 +160,20 @@ def main():
             variant = "pre_h_tile"
         if args.pre_only:
             metric = "pre_us"
+        if args.simd_reduce:
+            metric = "us_per_pair_at_32_pairs_per_event"
         writer.writerow(("batch", "hidden", "cycle", "order", "position", variant, metric))
         for cycle in range(1, args.cycles + 1):
             for order in permutations(routes):
                 order_label = "/".join(order)
                 for position, route in enumerate(order, start=1):
-                    latency = time_us(lambda: run(route), torch, args.warmup, args.repeat)
+                    def submit():
+                        for _ in range(pairs_per_event - 1):
+                            run(route)
+                        return run(route)
+
+                    measure = submit if args.simd_reduce else lambda: run(route)
+                    latency = time_us(measure, torch, args.warmup, args.repeat) / pairs_per_event
                     medians[route].append(latency)
                     positions[route][position - 1].append(latency)
                     writer.writerow((batch, hidden, cycle, order_label, position, route, f"{latency:.3f}"))
