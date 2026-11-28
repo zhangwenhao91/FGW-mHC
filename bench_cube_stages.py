@@ -56,6 +56,40 @@ def replay_stage_times(run, torch, warmup, repeat, launches_per_event):
     return stages
 
 
+def profile_projection(run, torch, profiler, directory, warmup, launches):
+    for _ in range(warmup):
+        run()
+    torch.npu.synchronize()
+    directory.mkdir(parents=True, exist_ok=True)
+    with profiler.profile(
+        activities=[profiler.ProfilerActivity.NPU],
+        schedule=profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+        on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
+        experimental_config=profiler._ExperimentalConfig(
+            profiler_level=profiler.ProfilerLevel.Level1,
+            aic_metrics=profiler.AiCMetrics.PipeUtilization,
+            l2_cache=False,
+            data_simplification=False,
+        ),
+    ) as capture:
+        for _ in range(launches):
+            run()
+        torch.npu.synchronize()
+        capture.step()
+
+    reports = sorted(path for path in directory.rglob("*.csv")
+                     if path.name.startswith(("kernel_details", "op_summary", "ai_core")))
+    if not reports:
+        print(f"No pipe metrics CSV recognized under {directory}", flush=True)
+    for path in reports:
+        print(f"Pipe profiler report: {path}", flush=True)
+        with path.open(encoding="utf-8-sig", errors="replace") as source:
+            for _ in range(2):
+                line = source.readline()
+                if line:
+                    print(line.rstrip(), flush=True)
+
+
 def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     from fgw_mhc import _compile
 
@@ -68,7 +102,7 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     post = bias.new_empty((batch, 4))
     weights = bias.new_empty((batch, 24))
     projection = bias.new_empty((batch, 32))
-    if args.projection_k_sweep or args.projection_buffer_sweep:
+    if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection:
         flat = x.float()
         expected_projection = flat @ phi
         expected_squares = flat.square().sum(-1)
@@ -100,7 +134,9 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
             torch.testing.assert_close(projection[:, 24], expected_squares, atol=0.01, rtol=0.01)
             return run
 
-        if args.projection_buffer_sweep:
+        if args.profile_projection:
+            variants = (("projection_k512_stages1", prepare(512, 1)),)
+        elif args.projection_buffer_sweep:
             variants = tuple((f"projection_k512_stages{stages}", prepare(512, stages)) for stages in (1, 2))
             if args.projection_a_ping_pong:
                 variants += (("projection_k512_stages2_a_ping_pong", prepare(512, 2, True)),)
@@ -156,10 +192,16 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
             duration = time_us(submit, torch, args.warmup, args.repeat) / count
             samples[name].append(duration)
-            writer.writerow((batch, hidden, "cube_m_only_k512" if args.ablate_k512 or args.projection_buffer_sweep else "cube_m_only", name, f"{duration:.3f}", count, 1, 0.02))
+            writer.writerow((batch, hidden, "cube_m_only_k512" if args.ablate_k512 or args.projection_buffer_sweep or args.profile_projection else "cube_m_only", name, f"{duration:.3f}", count, 1, 0.02))
     for name, values in samples.items():
         print(f"N={batch} H={hidden} {name}: median {median(values):.3f} us, "
               f"range {min(values):.3f}–{max(values):.3f} us", flush=True)
+    if args.profile_projection:
+        from torch_npu import profiler
+
+        profile_projection(variants[0][1], torch, profiler, args.profile_projection,
+                           args.warmup, max(8, count))
+
 
 
 def main():
@@ -172,6 +214,7 @@ def main():
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
     parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
+    parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
     parser.add_argument("--launches-per-event", type=int, default=1,
@@ -180,6 +223,10 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.profile_projection and (
+        not args.ablate_m_only or args.projection_k_sweep or args.projection_buffer_sweep
+    ):
+        parser.error("--profile-projection requires --ablate-m-only without a projection sweep")
     if args.projection_a_ping_pong and not args.projection_buffer_sweep:
         parser.error("--projection-a-ping-pong requires --projection-buffer-sweep")
     if args.dump_projection_code is not None and not args.projection_buffer_sweep:
@@ -208,7 +255,7 @@ def main():
         writer = csv.writer(output)
         writer.writerow(("batch", "hidden", "projection", "stage", "median_us", "launches_per_event", "sinkhorn_iters", "sinkhorn_eps"))
         cases = ((1024, 2560), (4096, 2560)) if args.ablate_m_only else CASES
-        if args.projection_k_sweep or args.projection_buffer_sweep:
+        if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection:
             cases = cases[:1]
         for batch, hidden in cases:
             width = 4 * hidden
@@ -220,7 +267,7 @@ def main():
                 continue
             iters, eps = (1, 0.02) if args.tileops_spec or args.ablate_m_only else (20, 1e-6)
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, iters, eps)
-            expected = None if args.projection_k_sweep or args.projection_buffer_sweep else pre_reference(*inputs)
+            expected = None if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection else pre_reference(*inputs)
             if args.ablate_m_only:
                 ablate_m_only(writer, torch, args, inputs, expected, batch, hidden)
                 output.flush()
