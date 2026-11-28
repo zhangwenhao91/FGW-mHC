@@ -19,7 +19,8 @@ case "${2:-all}" in
     profile-n4096) modes=(large-k512-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     tiling-large) modes=(tiling); label=tileops-spec ;;
     large-k512-post-double) modes=(large-k512-post-double); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double]" >&2; exit 2 ;;
+    profile-n4096-post-double) modes=(large-k512-post-double-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -53,16 +54,16 @@ for mode in "${modes[@]}"; do
         fi
     fi
     tilelang_args=()
-    if [[ "$mode" == large-k512-post-double ]]; then
+    if [[ "$mode" == large-k512-post-double || "$mode" == large-k512-post-double-profile ]]; then
         common+=(--n4096-only)
         merge_args+=(--n4096-only)
         tilelang_args+=(--full-h-double-post)
     fi
     tilelang_output=(--output "$prefix-tilelang.csv")
     vllm_output=(--output "$prefix-vllm.csv")
-    if [[ "$mode" == profile || "$mode" == large-k512-profile ]]; then
+    if [[ "$mode" == profile || "$mode" == large-k512-*-profile || "$mode" == large-k512-profile ]]; then
         profile_batch=4
-        if [[ "$mode" == large-k512-profile ]]; then
+        if [[ "$mode" == large-k512* ]]; then
             profile_batch=4096
         fi
         profile_dir="$prefix-b$profile_batch-$(date +%Y%m%d-%H%M%S)-$$"
@@ -109,7 +110,7 @@ for mode in "${modes[@]}"; do
         fi
         run_vllm
     fi
-    if [[ "$mode" == profile || "$mode" == large-k512-profile ]]; then
+    if [[ "$mode" == profile || "$mode" == large-k512-*-profile || "$mode" == large-k512-profile ]]; then
         cat "$profile_dir"/{tilelang,vllm}/"b$profile_batch-h2560"/unprofiled-pair.csv
         continue
     fi
