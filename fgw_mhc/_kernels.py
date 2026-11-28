@@ -456,7 +456,7 @@ def project_cube_m_only(
     x, phi, bias, h_post, x_res, x_layer, trace, *,
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
-    projection_only: bool = False, k_pipeline_stages: int = 1,
+    projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     rows = 16
@@ -481,7 +481,10 @@ def project_cube_m_only(
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
         squares_ub = T.alloc_shared((splits, half, 8), T.float32)
-        a_l1 = T.alloc_l1((rows, chunk), T.float32)
+        if a_ping_pong:
+            a_slots_l1 = T.alloc_l1((2, rows, chunk), T.float32)
+        else:
+            a_l1 = T.alloc_l1((rows, chunk), T.float32)
         b_l1 = T.alloc_l1((chunk, cols), T.float32)
         a_l0 = T.alloc_l0a((rows, mad_k), T.float32)
         b_l0 = T.alloc_l0b((cols, mad_k), T.float32)
@@ -532,9 +535,15 @@ def project_cube_m_only(
                                 ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
                                 S.vsstb(zero, ptr, nz_stride, full)
                 # Both Vector halves publish their rows to the same Cube L1 tile.
-                T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
+                if a_ping_pong:
+                    T.dual_copy(nz_ub[0:half, 0:chunk], a_slots_l1[part % 2, 0:rows, 0:chunk])
+                else:
+                    T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
                 if chunk == mad_k:
-                    T.copy(a_l1, a_l0)
+                    if a_ping_pong:
+                        T.copy(a_slots_l1[part % 2, 0:rows, 0:chunk], a_l0)
+                    else:
+                        T.copy(a_l1, a_l0)
                     T.copy(b_l1, b_l0, transpose=True)
                     # Keep L0C live through intermediate MADs and release it for the final Fixpipe copy.
                     T.gemm(
@@ -544,7 +553,10 @@ def project_cube_m_only(
                 else:
                     for mad in T.serial(chunk // mad_k):
                         offset = mad * mad_k
-                        T.copy(a_l1[:, offset:offset + mad_k], a_l0)
+                        if a_ping_pong:
+                            T.copy(a_slots_l1[part % 2, 0:rows, offset:offset + mad_k], a_l0)
+                        else:
+                            T.copy(a_l1[:, offset:offset + mad_k], a_l0)
                         T.copy(b_l1[offset:offset + mad_k, :], b_l0, transpose=True)
                         T.gemm(
                             a_l0, b_l0, acc, transpose_B=True,

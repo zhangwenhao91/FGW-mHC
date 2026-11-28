@@ -75,20 +75,21 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         sources = {}
 
-        def prepare(chunk, stages):
+        def prepare(chunk, stages, a_ping_pong=False):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
-                projection_only=True, k_pipeline_stages=stages,
+                projection_only=True, k_pipeline_stages=stages, a_ping_pong=a_ping_pong,
             )
 
             if args.dump_projection_code is not None:
                 source = kernel.get_kernel_source()
                 if not source:
                     raise RuntimeError(f"TileLang returned no device source for {stages} pipeline stages")
-                path = args.dump_projection_code / f"projection_k{chunk}_stages{stages}.cpp"
+                suffix = "_a_ping_pong" if a_ping_pong else ""
+                path = args.dump_projection_code / f"projection_k{chunk}_stages{stages}{suffix}.cpp"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source, encoding="utf-8")
-                sources[stages] = (path, source)
+                sources[stages, a_ping_pong] = (path, source)
                 print(f"Generated device source: {path}", flush=True)
 
             def run():
@@ -101,14 +102,17 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         if args.projection_buffer_sweep:
             variants = tuple((f"projection_k512_stages{stages}", prepare(512, stages)) for stages in (1, 2))
+            if args.projection_a_ping_pong:
+                variants += (("projection_k512_stages2_a_ping_pong", prepare(512, 2, True)),)
             if sources:
-                first_path, first = sources[1]
-                second_path, second = sources[2]
+                first_path, first = sources[2, False] if args.projection_a_ping_pong else sources[1, False]
+                second_path, second = sources[2, args.projection_a_ping_pong]
                 diff = "".join(unified_diff(
                     first.splitlines(keepends=True), second.splitlines(keepends=True),
                     fromfile=first_path.name, tofile=second_path.name,
                 ))
-                diff_path = args.dump_projection_code / "pipeline.diff"
+                diff_name = "a-ping-pong.diff" if args.projection_a_ping_pong else "pipeline.diff"
+                diff_path = args.dump_projection_code / diff_name
                 diff_path.write_text(diff, encoding="utf-8")
                 print(f"Generated device sources {'differ' if diff else 'are identical'}. Diff: {diff_path}", flush=True)
         else:
@@ -163,6 +167,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--simd-reduce", action="store_true", help="Compare baseline and SIMD partial reduction")
     parser.add_argument("--ablate-m-only", action="store_true", help="Compare full Pre, coefficients, and projection at N=1024 and 4096")
+    parser.add_argument("--projection-a-ping-pong", action="store_true", help="Add an explicit two-slot activation L1 variant")
     parser.add_argument("--dump-projection-code", type=Path, help="Save the device sources and diff for the buffer sweep")
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
@@ -175,6 +180,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.projection_a_ping_pong and not args.projection_buffer_sweep:
+        parser.error("--projection-a-ping-pong requires --projection-buffer-sweep")
     if args.dump_projection_code is not None and not args.projection_buffer_sweep:
         parser.error("--dump-projection-code requires --projection-buffer-sweep")
     if args.projection_buffer_sweep and (not args.ablate_m_only or args.projection_k_sweep):
