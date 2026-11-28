@@ -197,7 +197,7 @@ def main():
         post_options = {
             "default": {},
             "two_streams_h512": {"streams_per_task": 2, "post_tile": 512},
-            "four_streams_h256": {"streams_per_task": 4, "post_tile": 256},
+            "four_streams_h320": {"streams_per_task": 4, "post_tile": 320},
         }
 
     post_only = args.post_streams or (args.large_post_tiles and not args.post_pair)
