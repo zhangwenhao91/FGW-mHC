@@ -174,7 +174,9 @@ def main():
     elif args.grouped_k:
         routes = ("cube_full", "cube_full_g2", "cube_full_g4")
     elif args.cache_pre_residual:
-        routes = ("cube_m_only_k512_batched", "cube_m_only_k512_cached_input")
+        routes = (
+            "cube_m_only_k512_batched", "cube_m_only_k512_cached_input", "cube_m_only_k512_windowed_cache",
+        )
     elif args.l0_ping_pong:
         routes = ("cube_m_only_k512_batched", "cube_m_only_k512_batched_l0")
     elif args.batch_coefficients:
