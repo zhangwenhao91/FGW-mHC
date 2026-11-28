@@ -36,13 +36,30 @@ def merge(pr_path, vllm_path, output):
             writer.writerow((*key, f"{latency:.3f}", f"{vllm[key]:.3f}", f"{vllm[key] / latency:.3f}"))
 
 
-def load_ops(backend, pr_repo, torch):
+def load_ops(args, torch):
+    backend, pr_repo = args.backend, args.pr_repo
     if backend == "pr25":
         head = subprocess.check_output(["git", "-C", str(pr_repo), "rev-parse", "HEAD"], text=True).strip()
         if head != PR_HEAD:
             raise ValueError(f"{pr_repo}: need PR #25 commit {PR_HEAD}, found {head}")
         sys.path.insert(0, str(pr_repo.resolve() / "examples" / "ascend"))
-        from mhc.mhc_pre import mhc_pre
+        from mhc.mhc_pre import _select_kernel, mhc_pre
+        from tilelang.ascend.language import annotations
+
+        if "write_counter" not in annotations._VALID_BUFFER_VERSION_MODES:
+            unsupported = [
+                f"N={tokens}/H={hidden}"
+                for hidden in args.hidden
+                for tokens in args.tokens
+                if not _select_kernel(tokens, hidden)["kernel_kwargs"].get("full_m_tiles", True)
+            ]
+            if unsupported:
+                raise RuntimeError(
+                    f"{annotations.__file__} lacks write_counter; PR #25 requires it for "
+                    f"{', '.join(unsupported)}. Run with --tokens 1 128 1024 on this build, "
+                    "or use a TileLang build from the PR for the full suite."
+                )
+
         from mhc.mhc_post import mhc_post
         return mhc_pre, mhc_post
 
@@ -157,7 +174,7 @@ def main():
 
     device = torch.device(args.device)
     torch.npu.set_device(device)
-    pre, post = load_ops(args.backend, args.pr_repo, torch)
+    pre, post = load_ops(args, torch)
     with args.output.open("w", encoding="utf-8", newline="") as out:
         writer = csv.writer(out)
         writer.writerow(("backend", *SETTINGS, "latency_us"))
