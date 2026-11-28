@@ -177,7 +177,7 @@ def mhc_pre(
 
 
 def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, streams_per_task=4,
-             post_tile=None, pipeline_depth=3, output_cache="normal_fv"):
+             post_tile=None, pipeline_depth=3, output_cache="normal_fv", _launch=_run_kernel):
     """Return the flattened BF16 residual plus the scaled layer output."""
     batch, hidden = _check_input(x_layer_out)
     device = x_layer_out.device
@@ -213,5 +213,6 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
         "post", batch=batch, hidden=hidden, tile=tile, cores=cores, stages=stages,
         streams=group_width, total_streams=streams, output_cache=output_cache,
     )
-    kernel(x_layer_out, h_post, x_res.view(batch, streams, hidden), out.view(batch, streams, hidden))
+    _launch("post", kernel, x_layer_out, h_post, x_res.view(batch, streams, hidden),
+            out.view(batch, streams, hidden))
     return out

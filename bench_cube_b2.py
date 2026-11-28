@@ -1,6 +1,7 @@
 """Retest Cube pair latency with all execution orders on one NPU."""
 import argparse
 import csv
+from functools import partial
 from itertools import permutations
 from pathlib import Path
 from statistics import median
@@ -72,6 +73,7 @@ def main():
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
     parser.add_argument("--double-window-stage", action="store_true", help="Compare single- and double-slot guarded window staging")
     parser.add_argument("--guarded-window-cache", action="store_true", help="Compare windowed caching with per-window MTE2 reuse guards")
+    parser.add_argument("--bound-simd-pairs", action="store_true", help="Compare normal calls with bound kernels and reused outputs")
     parser.add_argument("--profile-simd-pairs", type=Path, help="Capture interleaved SIMD reduction pairs after timing")
     parser.add_argument("--verify-windowed-cache", type=Path, help="Dump device source and stress-test the windowed cache path")
     parser.add_argument("--cache-pre-residual", action="store_true", help="Compare retaining Pre input residual in UB")
@@ -122,6 +124,8 @@ def main():
         parser.error("--m-only-k-window and --large-post-tiles use batches 1024 and 4096, and other modes use 1, 2, or 4")
     if args.b4_post_tiles and args.batch != 4:
         parser.error("--b4-post-tiles requires --batch 4")
+    if args.bound_simd_pairs and (not args.simd_reduce or args.profile_simd_pairs):
+        parser.error("--bound-simd-pairs requires --simd-reduce without profiling")
     if args.profile_simd_pairs and not args.simd_reduce:
         parser.error("--profile-simd-pairs requires --simd-reduce")
     if args.simd_reduce and args.batch != 4:
@@ -205,7 +209,11 @@ def main():
 
     post_only = args.post_streams or (args.large_post_tiles and not args.post_pair)
 
+    bound_pairs = {}
+
     def run(route):
+        if route in bound_pairs:
+            return bound_pairs[route]()
         if args.post_pair:
             residual, layer_in, weights = mhc_pre(*inputs, projection="cube_m_only_k512_batched")
             return residual, layer_in, weights, mhc_post(layer, weights, residual, **post_options[route])
@@ -273,6 +281,28 @@ def main():
         routes = ("cube_full", "cube_full_k")
     elif args.tail:
         routes = ("cube_full", "cube_full_tail")
+    if args.bound_simd_pairs:
+        def bind_pair(projection):
+            launches = []
+
+            def bind_launch(stage, kernel, *tensors):
+                launches.append(partial(kernel, *tensors))
+
+            residual, layer_in, weights = mhc_pre(*inputs, projection=projection, _launch=bind_launch)
+            out = mhc_post(layer, weights, residual, _launch=bind_launch)
+            launch_pre, launch_post = launches
+            outputs = (residual, layer_in, weights, out)
+
+            def pair():
+                launch_pre()
+                launch_post()
+                return outputs
+
+            return pair
+
+        bound_pairs = {f"{route}_bound": bind_pair(route) for route in routes}
+        routes += tuple(bound_pairs)
+
     for route in routes:
         actual = run(route)
         names = ("post",) if post_only else ("x_res", "x_layer", "h_post", "pair")
