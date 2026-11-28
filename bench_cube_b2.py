@@ -11,7 +11,7 @@ from bench_mhc import CASES, time_us
 ROUTES = ("cube", "cube_mk", "cube_full")
 
 
-def prepare_fresh_pair(inputs, layer, projection, *, direct_launch=False):
+def prepare_fresh_pair(inputs, layer, projection, *, direct_launch=False, cpp_allocate=False):
     """Specialize launch configuration once while allocating independent results per call."""
     from fgw_mhc import mhc_post, mhc_pre
 
@@ -33,7 +33,7 @@ def prepare_fresh_pair(inputs, layer, projection, *, direct_launch=False):
         pre, post = export(pre), export(post)
     batch, hidden = layer.shape
 
-    def pair(phi, x, bias, layer_out):
+    def allocate_python(x, bias):
         partial = bias.new_empty(partial_shape)
         squares = bias.new_empty(squares_shape)
         workspace = bias.new_empty((batch, 24))
@@ -41,6 +41,25 @@ def prepare_fresh_pair(inputs, layer, projection, *, direct_launch=False):
         layer_in = x.new_empty((batch, hidden))
         weights = bias.new_empty((batch, 4))
         out = x.new_empty((batch, 4, hidden))
+        return partial, squares, workspace, residual, layer_in, weights, out
+
+    allocate = allocate_python
+    if cpp_allocate:
+        from torch.utils.cpp_extension import load
+
+        module = load(
+            name="fgw_mhc_bench_allocate",
+            sources=[str(Path(__file__).with_name("bench_mhc_allocate.cpp").resolve())],
+            extra_cflags=["-O2", "-g0"],
+            with_cuda=False,
+        )
+        allocate_native = module.bind_allocate(layer, partial_shape, squares_shape, batch, hidden)
+
+        def allocate(x, bias):
+            return allocate_native()
+
+    def pair(phi, x, bias, layer_out):
+        partial, squares, workspace, residual, layer_in, weights, out = allocate(x, bias)
         pre(x, phi, partial, squares, partial, squares, bias, workspace, weights, residual, layer_in)
         post(layer_out, weights, residual, out)
         return residual.flatten(1), layer_in, weights, out.flatten(1)
