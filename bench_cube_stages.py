@@ -120,7 +120,7 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 source = kernel.get_kernel_source()
                 if not source:
                     raise RuntimeError(f"TileLang returned no device source for {stages} pipeline stages")
-                suffix = "_a_ping_pong" if a_ping_pong else ""
+                suffix = "_a_ping_pong" if a_ping_pong else "_deferred" if accumulate_squares else ""
                 path = args.dump_projection_code / f"projection_k{chunk}_stages{stages}{suffix}.cpp"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source, encoding="utf-8")
@@ -133,11 +133,20 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
             run()
             torch.testing.assert_close(projection[:, :24], expected_projection, atol=0.01, rtol=0.01)
             if compute_squares:
-                torch.testing.assert_close(projection[:, 24], expected_squares, atol=0.01, rtol=0.01)
+                torch.testing.assert_close(
+                    projection[:, 24], expected_squares, atol=0.01,
+                    rtol=0.001 if args.deferred_buffer_sweep else 0.01,
+                )
             return run
 
         if args.profile_projection:
-            variants = (("projection_k512_stages1", prepare(512, 1)),)
+            if args.deferred_buffer_sweep:
+                variants = tuple(
+                    (f"projection_k512_deferred_stages{stages}", prepare(512, stages, accumulate_squares=True))
+                    for stages in (1, 2)
+                )
+            else:
+                variants = (("projection_k512_stages1", prepare(512, 1)),)
             if args.accumulate_squares:
                 variants += (("projection_k512_deferred_squares", prepare(512, 1, accumulate_squares=True)),)
             if args.compare_squares:
@@ -223,6 +232,7 @@ def main():
     parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
     parser.add_argument("--accumulate-squares", action="store_true", help="Compare per-window and deferred square reductions")
     parser.add_argument("--compare-squares", action="store_true", help="Also profile projection with squared sum disabled")
+    parser.add_argument("--deferred-buffer-sweep", action="store_true", help="Profile one and two K stages with deferred square reduction")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
@@ -242,8 +252,12 @@ def main():
         parser.error("--profile-projection requires --ablate-m-only without a projection sweep")
     if args.projection_a_ping_pong and not args.projection_buffer_sweep:
         parser.error("--projection-a-ping-pong requires --projection-buffer-sweep")
-    if args.dump_projection_code is not None and not args.projection_buffer_sweep:
-        parser.error("--dump-projection-code requires --projection-buffer-sweep")
+    if args.dump_projection_code is not None and not (args.projection_buffer_sweep or args.deferred_buffer_sweep):
+        parser.error("--dump-projection-code requires a buffer sweep")
+    if args.deferred_buffer_sweep and (
+        not args.profile_projection or args.accumulate_squares or args.compare_squares
+    ):
+        parser.error("--deferred-buffer-sweep requires --profile-projection without other square comparisons")
     if args.projection_buffer_sweep and (not args.ablate_m_only or args.projection_k_sweep):
         parser.error("--projection-buffer-sweep requires --ablate-m-only without --projection-k-sweep")
     if args.ablate_k512 and (not args.ablate_m_only or args.projection_k_sweep):
