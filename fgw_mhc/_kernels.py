@@ -451,6 +451,62 @@ def project_cube_fused(
                     T.copy(post_ub[0:4], h_post[token, 0])
 
 
+@T.macro
+def _m_only_k_window(
+    x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
+    vector_m, part, batch, half, cols, chunk, mad_k, splits,
+):
+    k = part * chunk
+    # The tail load zero-pads any rows outside the real batch.
+    T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
+    T.copy(phi[k:k + chunk, 0:cols], b_l1)
+    with T.SimdVF():
+        full = S.pset(32)
+        first = S.pset(32, "PAT_VL1")
+        eight = S.pset(32, "PAT_VL8")
+        zero = S.vdup(T.float32(0), T.float32, full)
+        nz_stride = T.int32((half + 1) << 16)
+        valid_rows = T.min(T.max(batch - vector_m, 0), half)
+        for row in T.serial(valid_rows):
+            squared = S.alloc_local((1,), T.float32)
+            squared[0] = zero
+            for col_tile in T.unroll(chunk // 64, explicit=True):
+                col = col_tile * 64
+                values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
+                ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                S.vsstb(values, ptr, nz_stride, full)
+                S.vmula(squared[0], values, values, full)
+            total = S.vcadd(squared[0], full)
+            S.vsts(squares_ub[part, row, 0], S.vsel(total, zero, first), eight)
+        if valid_rows < half:
+            for row_index in T.serial(half - valid_rows):
+                row = valid_rows + row_index
+                for col_tile in T.unroll(chunk // 64, explicit=True):
+                    col = col_tile * 64
+                    ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
+                    S.vsstb(zero, ptr, nz_stride, full)
+    # Both Vector halves publish their rows to the same Cube L1 tile.
+    T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
+    if chunk == mad_k:
+        T.copy(a_l1, a_l0)
+        T.copy(b_l1, b_l0, transpose=True)
+        # Keep L0C live through intermediate MADs and release it for the final Fixpipe copy.
+        T.gemm(
+            a_l0, b_l0, acc, transpose_B=True, clear_accum=part == 0,
+            unit_flag_ctrl=T.Select(part == splits - 1, 3, 2),
+        )
+    else:
+        for mad in T.serial(chunk // mad_k):
+            offset = mad * mad_k
+            T.copy(a_l1[:, offset:offset + mad_k], a_l0)
+            T.copy(b_l1[offset:offset + mad_k, :], b_l0, transpose=True)
+            T.gemm(
+                a_l0, b_l0, acc, transpose_B=True,
+                clear_accum=(part == 0) & (mad == 0),
+                unit_flag_ctrl=T.Select((part == splits - 1) & (mad == chunk // mad_k - 1), 3, 2),
+            )
+
+
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def project_cube_m_only(
     x, phi, bias, h_post, x_res, x_layer, trace, *,
@@ -463,6 +519,7 @@ def project_cube_m_only(
     half = rows // 2
     cols = 32
     splits = width // chunk
+    assert not a_ping_pong or splits % 2 == 0
     mad_k = min(chunk, 256)
     row_tiles = (batch + rows - 1) // rows
     cores = min(row_tiles, 28)
@@ -481,10 +538,9 @@ def project_cube_m_only(
         nz_ub = T.alloc_shared((half + 1, chunk), T.float32)
         T.annotate_layout({nz_ub: make_ascend_compact_nz_layout(nz_ub)})
         squares_ub = T.alloc_shared((splits, half, 8), T.float32)
+        a_l1 = T.alloc_l1((rows, chunk), T.float32)
         if a_ping_pong:
-            a_slots_l1 = T.alloc_l1((2, rows, chunk), T.float32)
-        else:
-            a_l1 = T.alloc_l1((rows, chunk), T.float32)
+            a_next_l1 = T.alloc_l1((rows, chunk), T.float32)
         b_l1 = T.alloc_l1((chunk, cols), T.float32)
         a_l0 = T.alloc_l0a((rows, mad_k), T.float32)
         b_l0 = T.alloc_l0b((cols, mad_k), T.float32)
@@ -504,65 +560,23 @@ def project_cube_m_only(
         T.set_hf32_mode("nearest_even")
         for row_tile in T.Persistent([row_tiles], cores, core):
             vector_m = row_tile * rows + side * half
-            for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
-                k = part * chunk
-                # The tail load zero-pads any rows outside the real batch.
-                T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
-                T.copy(phi[k:k + chunk, 0:cols], b_l1)
-                with T.SimdVF():
-                    full = S.pset(32)
-                    first = S.pset(32, "PAT_VL1")
-                    eight = S.pset(32, "PAT_VL8")
-                    zero = S.vdup(T.float32(0), T.float32, full)
-                    nz_stride = T.int32((half + 1) << 16)
-                    valid_rows = T.min(T.max(batch - vector_m, 0), half)
-                    for row in T.serial(valid_rows):
-                        squared = S.alloc_local((1,), T.float32)
-                        squared[0] = zero
-                        for col_tile in T.unroll(chunk // 64, explicit=True):
-                            col = col_tile * 64
-                            values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
-                            ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
-                            S.vsstb(values, ptr, nz_stride, full)
-                            S.vmula(squared[0], values, values, full)
-                        total = S.vcadd(squared[0], full)
-                        S.vsts(squares_ub[part, row, 0], S.vsel(total, zero, first), eight)
-                    if valid_rows < half:
-                        for row_index in T.serial(half - valid_rows):
-                            row = valid_rows + row_index
-                            for col_tile in T.unroll(chunk // 64, explicit=True):
-                                col = col_tile * 64
-                                ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
-                                S.vsstb(zero, ptr, nz_stride, full)
-                # Both Vector halves publish their rows to the same Cube L1 tile.
-                if a_ping_pong:
-                    T.dual_copy(nz_ub[0:half, 0:chunk], a_slots_l1[part % 2, 0:rows, 0:chunk])
-                else:
-                    T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
-                if chunk == mad_k:
-                    if a_ping_pong:
-                        T.copy(a_slots_l1[part % 2, 0:rows, 0:chunk], a_l0)
-                    else:
-                        T.copy(a_l1, a_l0)
-                    T.copy(b_l1, b_l0, transpose=True)
-                    # Keep L0C live through intermediate MADs and release it for the final Fixpipe copy.
-                    T.gemm(
-                        a_l0, b_l0, acc, transpose_B=True, clear_accum=part == 0,
-                        unit_flag_ctrl=T.Select(part == splits - 1, 3, 2),
+            if a_ping_pong:
+                # Each call names its own A buffer so the scheduler can track slot reuse.
+                for window_pair in T.Pipelined(splits // 2, num_stages=k_pipeline_stages):
+                    _m_only_k_window(
+                        x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
+                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits,
                     )
-                else:
-                    for mad in T.serial(chunk // mad_k):
-                        offset = mad * mad_k
-                        if a_ping_pong:
-                            T.copy(a_slots_l1[part % 2, 0:rows, offset:offset + mad_k], a_l0)
-                        else:
-                            T.copy(a_l1[:, offset:offset + mad_k], a_l0)
-                        T.copy(b_l1[offset:offset + mad_k, :], b_l0, transpose=True)
-                        T.gemm(
-                            a_l0, b_l0, acc, transpose_B=True,
-                            clear_accum=(part == 0) & (mad == 0),
-                            unit_flag_ctrl=T.Select((part == splits - 1) & (mad == chunk // mad_k - 1), 3, 2),
-                        )
+                    _m_only_k_window(
+                        x, phi, x_ub, nz_ub, squares_ub, a_next_l1, b_l1, a_l0, b_l0, acc,
+                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits,
+                    )
+            else:
+                for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
+                    _m_only_k_window(
+                        x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
+                        vector_m, part, batch, half, cols, chunk, mad_k, splits,
+                    )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
             for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
