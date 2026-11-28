@@ -198,6 +198,6 @@ for round_id, (fgw_path, vllm_path) in enumerate(zip(paths, paths, strict=True),
 for count, samples in ratios.items():
     wins = sum(value > 1 for value in samples)
     print(f"{count} pairs/event: median {median(samples):.3f}x, "
-          f"range {min(samples):.3f}¨C{max(samples):.3f}x, wins {wins}/{len(samples)}")
+          f"range {min(samples):.3f} to {max(samples):.3f}x, wins {wins}/{len(samples)}")
 PY
 fi
