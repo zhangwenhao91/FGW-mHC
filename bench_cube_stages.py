@@ -133,10 +133,17 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 kernel(x, phi, bias, post, residual, layer, projection)
 
             run()
-            torch.testing.assert_close(projection[:, :24], expected_projection, atol=0.01, rtol=0.01)
+            try:
+                torch.npu.synchronize()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Projection launch failed for N={batch}, H={hidden}, K={chunk}, "
+                    f"stages={stages}, block_nz={block_nz}"
+                ) from exc
+            torch.testing.assert_close(projection[:, :24].cpu(), expected_projection.cpu(), atol=0.01, rtol=0.01)
             if compute_squares:
                 torch.testing.assert_close(
-                    projection[:, 24], expected_squares, atol=0.01,
+                    projection[:, 24].cpu(), expected_squares.cpu(), atol=0.01,
                     rtol=0.001 if args.deferred_buffer_sweep else 0.01,
                 )
             return run
