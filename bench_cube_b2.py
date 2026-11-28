@@ -2,11 +2,57 @@
 import argparse
 import csv
 from itertools import permutations
+from pathlib import Path
 from statistics import median
 
 from bench_mhc import CASES, time_us
 
 ROUTES = ("cube", "cube_mk", "cube_full")
+
+
+def verify_windowed_cache(torch, inputs, layer, source_path):
+    from fgw_mhc import mhc_post, mhc_pre
+    from fgw_mhc.reference import post_reference, pre_reference
+
+    phi, residual, bias, *params = inputs
+    hidden = layer.shape[1]
+    cases = (inputs, (phi, -residual, bias, *params))
+    references = []
+    for case in cases:
+        x_res, x_layer, h_post = pre_reference(*case)
+        references.append((x_res, x_layer, h_post, post_reference(layer, h_post, x_res)))
+
+    def dump_launch(name, kernel, *tensors):
+        source = kernel.get_kernel_source()
+        if not source:
+            raise RuntimeError("TileLang returned no generated device source")
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(source, encoding="utf-8")
+        kernel(*tensors)
+
+    route = "cube_m_only_k512_windowed_cache"
+    mhc_pre(*inputs, projection=route, _launch=dump_launch)
+    torch.npu.synchronize()
+    print(f"Generated device source: {source_path}", flush=True)
+
+    names = ("x_res", "x_layer", "h_post", "pair")
+    launches = 8
+    for burst in range(4):
+        pending = []
+        for index in range(launches):
+            case_id = (burst + index) % len(cases)
+            x_res, x_layer, h_post = mhc_pre(*cases[case_id], projection=route)
+            out = mhc_post(layer, h_post, x_res, post_tile=hidden, pipeline=True, pipeline_depth=2)
+            pending.append((case_id, (x_res, x_layer, h_post, out)))
+        torch.npu.synchronize()
+        for index, (case_id, actual) in enumerate(pending):
+            for name, value, reference in zip(names, actual, references[case_id]):
+                try:
+                    torch.testing.assert_close(value, reference, atol=0.02 if name == "pair" else 0.01, rtol=0.01)
+                except AssertionError as exc:
+                    raise AssertionError(f"burst={burst + 1}, pair={index + 1}, input={case_id}, {name}: {exc}") from exc
+        pending.clear()
+        print(f"Alternating-input burst {burst + 1}: {launches} pairs passed", flush=True)
 
 
 def main():
@@ -24,6 +70,7 @@ def main():
     mode.add_argument("--simd-reduce", action="store_true", help="Compare SIMD partial reduction at 32 pairs per event")
     mode.add_argument("--simd", action="store_true", help="Compare cube_full with SIMD Sinkhorn only")
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
+    parser.add_argument("--verify-windowed-cache", type=Path, help="Dump device source and stress-test the windowed cache path")
     parser.add_argument("--cache-pre-residual", action="store_true", help="Compare retaining Pre input residual in UB")
     parser.add_argument("--l0-ping-pong", action="store_true", help="Compare L0 operand buffering in batched K512 Pre")
     parser.add_argument("--batch-coefficients", action="store_true", help="Compare per-token and batched coefficients in full K512 Pre")
@@ -46,6 +93,8 @@ def main():
         parser.error("--post-pair requires --large-post-tiles without --pre-only")
     if args.debug_m_only and not args.m_only:
         parser.error("--debug-m-only requires --m-only")
+    if args.verify_windowed_cache and (not args.cache_pre_residual or args.pre_only):
+        parser.error("--verify-windowed-cache requires --cache-pre-residual without --pre-only")
     if args.cache_pre_residual and (
         not args.m_only_k_window or args.l0_ping_pong or args.batch_coefficients
         or args.deferred_pipeline or args.deferred_squares
@@ -95,6 +144,10 @@ def main():
     layer = layer.to(device, torch.bfloat16)
     sinkhorn = (1, 0.02) if args.m_only or args.grouped_k or args.pre_h_tile or args.m_only_k_window or args.large_post_tiles or args.simd_reduce else (20, 1e-6)
     inputs = (phi, x, bias, 1.0, 1.0, 1.0, *sinkhorn)
+
+    if args.verify_windowed_cache:
+        verify_windowed_cache(torch, inputs, layer, args.verify_windowed_cache)
+        return
 
     if args.debug_m_only:
         from math import gcd
