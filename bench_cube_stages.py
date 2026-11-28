@@ -111,11 +111,11 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         sources = {}
 
-        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16, mad_k=0):
+        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16, mad_k=0, separate_nz=False):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
                 projection_only=True, k_pipeline_stages=stages, a_ping_pong=a_ping_pong,
-                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows, mad_k_override=mad_k,
+                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows, mad_k_override=mad_k, separate_nz=separate_nz,
             )
 
             if args.dump_projection_code is not None:
@@ -188,7 +188,12 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 ("projection_m256_k128_mad32", prepare(128, 2, accumulate_squares=True, rows=256, mad_k=32)),
             )
         elif args.profile_projection:
-            if args.deferred_buffer_sweep:
+            if args.compare_separate_nz:
+                variants = (
+                    ("projection_fused_nz", prepare(512, 2, accumulate_squares=True)),
+                    ("projection_separate_nz", prepare(512, 2, accumulate_squares=True, separate_nz=True)),
+                )
+            elif args.deferred_buffer_sweep:
                 variants = tuple(
                     (f"projection_k512_deferred_stages{stages}", prepare(512, stages, accumulate_squares=True))
                     for stages in (1, 2)
@@ -302,6 +307,7 @@ def main():
     parser.add_argument("--accumulate-squares", action="store_true", help="Compare per-window and deferred square reductions")
     parser.add_argument("--compare-squares", action="store_true", help="Also profile projection with squared sum disabled")
     parser.add_argument("--deferred-buffer-sweep", action="store_true", help="Profile one and two K stages with deferred square reduction")
+    parser.add_argument("--compare-separate-nz", action="store_true", help="Compare fused and separate AIV NZ conversion")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
@@ -315,6 +321,10 @@ def main():
         parser.error("--accumulate-squares requires --profile-projection")
     if args.compare_squares and not args.profile_projection:
         parser.error("--compare-squares requires --profile-projection")
+    if args.compare_separate_nz and (
+        not args.profile_projection or args.accumulate_squares or args.compare_squares or args.deferred_buffer_sweep
+    ):
+        parser.error("--compare-separate-nz requires --profile-projection without other projection comparisons")
     if args.profile_projection and (
         not args.ablate_m_only or args.projection_k_sweep or args.projection_buffer_sweep
     ):
