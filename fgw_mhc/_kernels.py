@@ -526,11 +526,7 @@ def project_cube_m_only(
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     assert projection_only or compute_squares
-    # Two-stage deferred accumulation is isolated to projection validation.
-    assert not accumulate_squares or (
-        compute_squares and not a_ping_pong
-        and (k_pipeline_stages == 1 or (projection_only and k_pipeline_stages == 2))
-    )
+    assert not accumulate_squares or (compute_squares and not a_ping_pong and k_pipeline_stages in (1, 2))
     rows = 16
     half = rows // 2
     cols = 32
