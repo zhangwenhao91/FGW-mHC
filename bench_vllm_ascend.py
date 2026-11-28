@@ -74,7 +74,7 @@ def prepare_vllm_opp():
     )
 
 
-def summarize_profile(directory, backend, steps):
+def summarize_profile(directory, backend, steps, *, routes=()):
     """Report device durations and gaps for consecutive native Pre/Post launches."""
     reports = list(directory.rglob("kernel_details.csv"))
     if not reports:
@@ -105,6 +105,21 @@ def summarize_profile(directory, backend, steps):
               f"{[(event[2], event[3]) for event in events]}", flush=True)
         return
     pairs = list(zip(events[::2], events[1::2]))
+    if not routes:
+        write_device_summary(directory, backend, pairs)
+        return
+    if len(routes) != len(pairs):
+        raise ValueError("Profile route labels must match the number of captured pairs")
+    for route in dict.fromkeys(routes):
+        route_dir = directory / route
+        route_dir.mkdir(exist_ok=True)
+        selected = [pair for name, pair in zip(routes, pairs, strict=True) if name == route]
+        write_device_summary(route_dir, route, selected, measure_between=False)
+
+
+def write_device_summary(directory, label, pairs, *, measure_between=True):
+    # Across-route intervals are excluded when the capture interleaves paths.
+    steps = len(pairs)
     totals = (
         median(pre[1] for pre, post in pairs),
         median(post[1] for pre, post in pairs),
@@ -114,20 +129,21 @@ def summarize_profile(directory, backend, steps):
     between_pairs = [
         next_pre[0] - (post[0] + post[1])
         for (_, post), (next_pre, _) in zip(pairs, pairs[1:])
+        if measure_between
     ]
     with (directory / "device-pair.csv").open("w", newline="", encoding="utf-8") as target:
         writer = csv.writer(target)
         writer.writerow(("backend", "pairs", "pre_us", "post_us", "pre_to_post_gap_us",
                          "pair_span_us", "post_to_next_pre_gap_us"))
-        writer.writerow((backend, steps, *(f"{value:.6f}" for value in totals),
+        writer.writerow((label, steps, *(f"{value:.6f}" for value in totals),
                          f"{median(between_pairs):.6f}" if between_pairs else ""))
     gap_suffix = f", post_to_next_pre_gap={median(between_pairs):.3f} us" if between_pairs else ""
-    print(f"{backend} device medians across {steps} profiled pairs: pre={totals[0]:.3f} us, "
+    print(f"{label} device medians across {steps} profiled pairs: pre={totals[0]:.3f} us, "
           f"post={totals[1]:.3f} us, pre_to_post_gap={totals[2]:.3f} us, "
           f"pair_span={totals[3]:.3f} us{gap_suffix}", flush=True)
 
 
-def profile_pair(pair, torch, profiler, directory, warmup, steps):
+def profile_pair(pair, torch, profiler, directory, warmup, steps, *, profile_step=None):
     for _ in range(warmup):
         pair()
     torch.npu.synchronize()
@@ -143,7 +159,10 @@ def profile_pair(pair, torch, profiler, directory, warmup, steps):
     ) as capture:
         for step in range(steps):
             with torch.profiler.record_function(f"mhc_pair_{step:02d}"):
-                pair(trace=True)
+                if profile_step is None:
+                    pair(trace=True)
+                else:
+                    profile_step(step)
             if step == steps - 1:
                 torch.npu.synchronize()
             capture.step()

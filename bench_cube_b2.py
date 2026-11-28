@@ -72,6 +72,7 @@ def main():
     parser.add_argument("--debug-m-only", action="store_true", help="Print M-only projection and squared sum before timing")
     parser.add_argument("--double-window-stage", action="store_true", help="Compare single- and double-slot guarded window staging")
     parser.add_argument("--guarded-window-cache", action="store_true", help="Compare windowed caching with per-window MTE2 reuse guards")
+    parser.add_argument("--profile-simd-pairs", type=Path, help="Capture interleaved SIMD reduction pairs after timing")
     parser.add_argument("--verify-windowed-cache", type=Path, help="Dump device source and stress-test the windowed cache path")
     parser.add_argument("--cache-pre-residual", action="store_true", help="Compare retaining Pre input residual in UB")
     parser.add_argument("--l0-ping-pong", action="store_true", help="Compare L0 operand buffering in batched K512 Pre")
@@ -121,6 +122,8 @@ def main():
         parser.error("--m-only-k-window and --large-post-tiles use batches 1024 and 4096, and other modes use 1, 2, or 4")
     if args.b4_post_tiles and args.batch != 4:
         parser.error("--b4-post-tiles requires --batch 4")
+    if args.profile_simd_pairs and not args.simd_reduce:
+        parser.error("--profile-simd-pairs requires --simd-reduce")
     if args.simd_reduce and args.batch != 4:
         parser.error("--simd-reduce requires --batch 4")
     if args.pre_h_tile and args.batch != 4:
@@ -327,6 +330,16 @@ def main():
         by_position = ", ".join(f"{median(values):.3f}" for values in positions[route])
         print(f"{route}: median {median(timings):.3f} us, range {min(timings):.3f}–{max(timings):.3f} us; "
               f"position medians [{by_position}] us")
+
+    if args.profile_simd_pairs:
+        from bench_vllm_ascend import profile_pair, summarize_profile
+
+        order = (routes + routes[::-1]) * 8
+        directory = args.profile_simd_pairs
+        profile_pair(lambda: run(order[0]), torch, torch_npu.profiler, directory, 0, len(order),
+                     profile_step=lambda step: run(order[step]))
+        summarize_profile(directory, "tilelang", len(order), routes=order)
+
 
 
 if __name__ == "__main__":
