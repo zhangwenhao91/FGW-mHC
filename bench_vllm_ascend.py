@@ -259,6 +259,9 @@ def main():
         parser.error("--compare-fresh-b4 requires a B4 TileLang cube_full sweep with default Post")
     if args.batch is not None and args.sweep_pairs is None:
         parser.error("--batch requires --sweep-pairs")
+    tileops_repo = os.environ.get("FGW_MHC_TILEOPS_REPO") if args.backend == "tilelang" else None
+    if tileops_repo and (not args.verify_b4_stream or args.compare_fresh_b4 or args.allocator_ab_b4):
+        parser.error("FGW_MHC_TILEOPS_REPO requires the normal B4 validation sweep")
     if args.merge:
         merge_results(*args.merge, args.output, cases=cases)
         return
@@ -283,6 +286,18 @@ def main():
     from fgw_mhc import mhc_post, mhc_pre
     from fgw_mhc.reference import post_reference, pre_reference
 
+    eps = 0.02 if args.tileops_spec else 1e-6
+    if tileops_repo:
+        source = Path(tileops_repo).resolve() / "src"
+        if not (source / "tileops" / "ascend.py").is_file():
+            parser.error(f"Missing TileOPs Ascend source under {source}")
+        sys.path.insert(0, str(source))
+        import tileops.ascend  # noqa: F401
+        from tileops.sequence_modeling import MHCPostFwdOp, MHCPreFwdOp
+
+        tileops_pre = MHCPreFwdOp(1.0, 1.0, 1.0, args.sinkhorn_iters, eps)
+        tileops_post = MHCPostFwdOp()
+
     device = torch.device(args.device)
     if args.backend != "tilelang":
         try:
@@ -297,7 +312,6 @@ def main():
             parser.exit(1, f"Could not load vLLM Ascend A5 HcPre/HcPost custom ops: {exc}\n")
 
     torch.npu.set_device(device)
-    eps = 0.02 if args.tileops_spec else 1e-6
     rng = torch.Generator().manual_seed(42)
     output_context = nullcontext(sys.stdout) if args.profile_dir or args.tiling_only else args.output.open("w", encoding="utf-8", newline="")
     with output_context as output:
@@ -367,6 +381,11 @@ def main():
                 continue
             if args.profile_dir and args.profile_batch is not None and batch != args.profile_batch:
                 continue
+
+            if tileops_repo:
+                def tilelang_pair():
+                    residual, layer_in, post = tileops_pre(phi, x, bias)
+                    return layer_in, post, tileops_post(layer_out, post, residual)
 
             if args.split_stages:
                 if args.backend == "tilelang":
@@ -452,10 +471,26 @@ def main():
                 stream = torch.npu.Stream(device=device)
                 stream.wait_stream(torch.npu.current_stream(device))
                 with torch.npu.stream(stream):
-                    first = mhc_pre(*pre_args, projection=route)
-                    first_out = mhc_post(layer_out, first[2], first[0])
-                    second = mhc_pre(*pre_args, projection=route)
-                    second_out = mhc_post(layer_out, second[2], second[0])
+                    if tileops_repo:
+                        first = tileops_pre(phi, x, bias)
+                        first_out = tileops_post(layer_out, first[2], first[0])
+                        second = tileops_pre(phi, x, bias)
+                        second_out = tileops_post(layer_out, second[2], second[0])
+                    else:
+                        first = mhc_pre(*pre_args, projection=route)
+                        first_out = mhc_post(layer_out, first[2], first[0])
+                        second = mhc_pre(*pre_args, projection=route)
+                        second_out = mhc_post(layer_out, second[2], second[0])
+                if tileops_repo:
+                    kernels = [k for op in (tileops_pre, tileops_post) for k in op.iter_kernels()]
+                    if len(kernels) != 2 or any(not type(k).__module__.startswith(
+                        "tileops._kernels.ascend."
+                    ) for k in kernels):
+                        raise RuntimeError(f"Expected two TileOPs Ascend kernels, got {kernels}")
+                    fused = [getattr(k, "_fused", None) is not None for k in kernels]
+                    if (source / "tileops/_kernels/ascend/sequence_modeling/_mhc_fused.py").is_file() and not all(fused):
+                        raise RuntimeError("TileOPs candidate did not select both fused kernels")
+                    print(f"TileOPs public entries from {source}, fused={fused}", flush=True)
                 stream.synchronize()
                 for outputs in ((*first, first_out), (*second, second_out)):
                     torch.testing.assert_close(outputs, (*expected_pre, expected[2]), atol=0.01, rtol=0.01)
