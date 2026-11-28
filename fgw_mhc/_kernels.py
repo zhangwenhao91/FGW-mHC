@@ -454,7 +454,7 @@ def project_cube_fused(
 @T.macro
 def _m_only_k_window(
     x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-    vector_m, part, batch, half, cols, chunk, mad_k, splits,
+    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares,
 ):
     k = part * chunk
     # The tail load zero-pads any rows outside the real batch.
@@ -469,15 +469,18 @@ def _m_only_k_window(
         valid_rows = T.min(T.max(batch - vector_m, 0), half)
         for row in T.serial(valid_rows):
             squared = S.alloc_local((1,), T.float32)
-            squared[0] = zero
+            if compute_squares:
+                squared[0] = zero
             for col_tile in T.unroll(chunk // 64, explicit=True):
                 col = col_tile * 64
                 values = S.vcvt(S.vld(x_ub[row, col], dist="UNPK_B16"), T.float32, part=0)
                 ptr = S.make_ubuf_ptr(T.access_ptr(nz_ub[row, col], "w", 1, 64), "float32")
                 S.vsstb(values, ptr, nz_stride, full)
-                S.vmula(squared[0], values, values, full)
-            total = S.vcadd(squared[0], full)
-            S.vsts(squares_ub[part, row, 0], S.vsel(total, zero, first), eight)
+                if compute_squares:
+                    S.vmula(squared[0], values, values, full)
+            if compute_squares:
+                total = S.vcadd(squared[0], full)
+                S.vsts(squares_ub[part, row, 0], S.vsel(total, zero, first), eight)
         if valid_rows < half:
             for row_index in T.serial(half - valid_rows):
                 row = valid_rows + row_index
@@ -512,9 +515,10 @@ def project_cube_m_only(
     x, phi, bias, h_post, x_res, x_layer, trace, *,
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
-    projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False,
+    projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False, compute_squares: bool = True,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
+    assert projection_only or compute_squares
     rows = 16
     half = rows // 2
     cols = 32
@@ -565,32 +569,34 @@ def project_cube_m_only(
                 for window_pair in T.Pipelined(splits // 2, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits,
+                        vector_m, 2 * window_pair, batch, half, cols, chunk, mad_k, splits, compute_squares,
                     )
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_next_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits,
+                        vector_m, 2 * window_pair + 1, batch, half, cols, chunk, mad_k, splits, compute_squares,
                     )
             else:
                 for part in T.Pipelined(splits, num_stages=k_pipeline_stages):
                     _m_only_k_window(
                         x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-                        vector_m, part, batch, half, cols, chunk, mad_k, splits,
+                        vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares,
                     )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
             for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
                 token = vector_m + row
-                with T.SimtVF(threads=32):
-                    for lane in T.Parallel(8):
-                        value = T.alloc_var(T.float32, init=0.0)
-                        if lane == 0:
-                            for part in T.serial(splits):
-                                value += squares_ub[part, row, 0]
-                        sum_ub[0, lane] = value
+                if compute_squares:
+                    with T.SimtVF(threads=32):
+                        for lane in T.Parallel(8):
+                            value = T.alloc_var(T.float32, init=0.0)
+                            if lane == 0:
+                                for part in T.serial(splits):
+                                    value += squares_ub[part, row, 0]
+                            sum_ub[0, lane] = value
                 if debug or projection_only:
                     T.copy(raw_ub[row, 0:24], trace[token, 0:24])
-                    T.copy(sum_ub[0, 0:8], trace[token, 24:32])
+                    if compute_squares:
+                        T.copy(sum_ub[0, 0:8], trace[token, 24:32])
                 if not projection_only:
                     _compute_weights(
                         raw_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,

@@ -109,10 +109,11 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         sources = {}
 
-        def prepare(chunk, stages, a_ping_pong=False):
+        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
                 projection_only=True, k_pipeline_stages=stages, a_ping_pong=a_ping_pong,
+                compute_squares=compute_squares,
             )
 
             if args.dump_projection_code is not None:
@@ -131,11 +132,14 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
             run()
             torch.testing.assert_close(projection[:, :24], expected_projection, atol=0.01, rtol=0.01)
-            torch.testing.assert_close(projection[:, 24], expected_squares, atol=0.01, rtol=0.01)
+            if compute_squares:
+                torch.testing.assert_close(projection[:, 24], expected_squares, atol=0.01, rtol=0.01)
             return run
 
         if args.profile_projection:
             variants = (("projection_k512_stages1", prepare(512, 1)),)
+            if args.compare_squares:
+                variants += (("projection_k512_no_squares", prepare(512, 1, compute_squares=False)),)
         elif args.projection_buffer_sweep:
             variants = tuple((f"projection_k512_stages{stages}", prepare(512, stages)) for stages in (1, 2))
             if args.projection_a_ping_pong:
@@ -199,8 +203,9 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     if args.profile_projection:
         from torch_npu import profiler
 
-        profile_projection(variants[0][1], torch, profiler, args.profile_projection,
-                           args.warmup, max(8, count))
+        for name, run in variants:
+            profile_projection(run, torch, profiler, args.profile_projection / name,
+                               args.warmup, max(8, count))
 
 
 
@@ -214,6 +219,7 @@ def main():
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
     parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
+    parser.add_argument("--compare-squares", action="store_true", help="Also profile projection with squared sum disabled")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
@@ -223,6 +229,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.compare_squares and not args.profile_projection:
+        parser.error("--compare-squares requires --profile-projection")
     if args.profile_projection and (
         not args.ablate_m_only or args.projection_k_sweep or args.projection_buffer_sweep
     ):
