@@ -16,7 +16,8 @@ case "${2:-all}" in
     large-k512-deferred-pair) modes=(large-k512-deferred-pair); projection=cube_m_only_k512_deferred; label=tileops-spec ;;
     large-k512-s2) modes=(large-k512-s2-pair large-k512-s2-stages); projection=cube_m_only_k512_deferred_s2; label=tileops-spec ;;
     large-k512-batched) modes=(large-k512-batched-pair large-k512-batched-stages); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched]" >&2; exit 2 ;;
+    profile-n4096) modes=(large-k512-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -51,9 +52,13 @@ for mode in "${modes[@]}"; do
     fi
     tilelang_output=(--output "$prefix-tilelang.csv")
     vllm_output=(--output "$prefix-vllm.csv")
-    if [[ "$mode" == profile ]]; then
-        profile_dir="$prefix-b4-$(date +%Y%m%d-%H%M%S)-$$"
-        common+=(--profile-batch 4 --profile-dir "$profile_dir")
+    if [[ "$mode" == profile || "$mode" == large-k512-profile ]]; then
+        profile_batch=4
+        if [[ "$mode" == large-k512-profile ]]; then
+            profile_batch=4096
+        fi
+        profile_dir="$prefix-b$profile_batch-$(date +%Y%m%d-%H%M%S)-$$"
+        common+=(--profile-batch "$profile_batch" --profile-dir "$profile_dir")
         tilelang_output=()
         vllm_output=()
     fi
@@ -70,8 +75,8 @@ for mode in "${modes[@]}"; do
             quay.io/ascend/vllm-ascend:v0.30.0-a5 bench_vllm_ascend.py \
             --backend vllm "${common[@]}" "${vllm_output[@]}"
     fi
-    if [[ "$mode" == profile ]]; then
-        cat "$profile_dir"/{tilelang,vllm}/b4-h2560/unprofiled-pair.csv
+    if [[ "$mode" == profile || "$mode" == large-k512-profile ]]; then
+        cat "$profile_dir"/{tilelang,vllm}/"b$profile_batch-h2560"/unprofiled-pair.csv
         continue
     fi
     if [[ "$mode" == sweep ]]; then

@@ -92,7 +92,7 @@ def summarize_profile(directory, backend, steps):
         name_col, start_col, duration_col = (columns[name] for name in required)
         for row in reader:
             name = row[name_col].lower()
-            if ("project_cube_fused" in name if backend == "tilelang" else "hcpre" in name):
+            if (any(kernel in name for kernel in ("project_cube_fused", "project_cube_m_only")) if backend == "tilelang" else "hcpre" in name):
                 stage = "pre"
             elif ("post" in name if backend == "tilelang" else "hcpost" in name):
                 stage = "post"
@@ -111,9 +111,14 @@ def summarize_profile(directory, backend, steps):
         median(post[0] - (pre[0] + pre[1]) for pre, post in pairs),
         median(post[0] + post[1] - pre[0] for pre, post in pairs),
     )
+    between_pairs = [
+        next_pre[0] - (post[0] + post[1])
+        for (_, post), (next_pre, _) in zip(pairs, pairs[1:])
+    ]
+    gap_suffix = f", post_to_next_pre_gap={median(between_pairs):.3f} us" if between_pairs else ""
     print(f"{backend} device medians across {steps} profiled pairs: pre={totals[0]:.3f} us, "
           f"post={totals[1]:.3f} us, pre_to_post_gap={totals[2]:.3f} us, "
-          f"pair_span={totals[3]:.3f} us", flush=True)
+          f"pair_span={totals[3]:.3f} us{gap_suffix}", flush=True)
 
 
 def profile_pair(pair, torch, profiler, directory, warmup, steps):
@@ -152,7 +157,7 @@ def main():
                         help="Limit the event batch-size sweep to one workload")
     parser.add_argument("--split-stages", action="store_true", help="Measure each backend’s native Pre and Post separately")
     parser.add_argument("--profile-dir", type=Path, help="Capture consecutive pair launches with the NPU profiler")
-    parser.add_argument("--profile-batch", type=int, choices=[batch for batch, _ in CASES])
+    parser.add_argument("--profile-batch", type=int)
     parser.add_argument("--profile-steps", type=int, default=12)
     parser.add_argument("--large-tokens", action="store_true", help="Measure 256, 1024, and 4096 tokens at H=2560")
     parser.add_argument("--large-k512-cases", action="store_true", help="Use the 1024 and 4096 token K512 workloads")
@@ -169,10 +174,12 @@ def main():
     else:
         cases = LARGE_TOKEN_CASES if args.large_tokens else CASES
     if args.pairs_per_event < 1 or (args.pairs_per_event > 1 and (
-        args.merge or args.backend == "both" or args.profile_dir or args.sweep_pairs
+        args.merge or args.backend == "both" or args.sweep_pairs
     )):
         parser.error("--pairs-per-event must be positive and requires single-backend timing when greater than 1")
-    if args.large_tokens and (args.batch is not None or args.profile_batch is not None):
+    if args.profile_batch is not None and (not args.profile_dir or args.profile_batch not in dict(cases)):
+        parser.error("--profile-batch requires --profile-dir and a batch in the selected benchmark cases")
+    if args.large_tokens and args.batch is not None:
         parser.error("--large-tokens cannot be used with the small-case batch filters")
     if args.tileops_spec:
         if args.merge or args.backend == "both":
@@ -393,21 +400,27 @@ def main():
 
             if args.profile_dir:
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
+                def submit_profile_bracket():
+                    for _ in range(args.pairs_per_event - 1):
+                        pair()
+                    return pair()
+
+                bracket = pair if args.pairs_per_event == 1 else submit_profile_bracket
                 directory = args.profile_dir / args.backend / f"b{batch}-h{hidden}"
                 directory.mkdir(parents=True, exist_ok=True)
                 timings = directory / "unprofiled-pair.csv"
                 with timings.open("w", encoding="utf-8", newline="") as summary:
                     timing_writer = csv.writer(summary)
                     timing_writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters",
-                                            "warmup", "repeat", "phase", "pair_us"))
+                                            "warmup", "repeat", "phase", "pair_us", "pairs_per_event"))
                     for phase in ("before", "after"):
                         if phase == "after":
                             profile_pair(pair, torch, torch_npu.profiler, directory, args.warmup, args.profile_steps)
-                        latency = time_us(pair, torch, args.warmup, args.repeat)
+                        latency = time_us(bracket, torch, args.warmup, args.repeat) / args.pairs_per_event
                         if not math.isfinite(latency) or latency <= 0:
                             raise RuntimeError(f"Invalid unprofiled pair time for B={batch}, H={hidden}: {latency}")
                         timing_writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters,
-                                                args.warmup, args.repeat, phase, f"{latency:.6f}"))
+                                                args.warmup, args.repeat, phase, f"{latency:.6f}", args.pairs_per_event))
                         summary.flush()
                         print(f"{args.backend} B={batch} H={hidden} {phase} trace: {latency:.3f} us", flush=True)
                 summarize_profile(directory, args.backend, args.profile_steps)
