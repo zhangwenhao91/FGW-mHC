@@ -51,7 +51,8 @@ def load_ops(args, torch):
                 f"N={tokens}/H={hidden}"
                 for hidden in args.hidden
                 for tokens in args.tokens
-                if not _select_kernel(tokens, hidden)["kernel_kwargs"].get("full_m_tiles", True)
+                if (config := _select_kernel(tokens, hidden))["route"] == "large"
+                and not config["kernel_kwargs"]["full_m_tiles"]
             ]
             if unsupported:
                 raise RuntimeError(
