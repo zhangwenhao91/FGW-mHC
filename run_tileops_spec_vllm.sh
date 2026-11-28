@@ -17,7 +17,8 @@ case "${2:-all}" in
     large-k512-s2) modes=(large-k512-s2-pair large-k512-s2-stages); projection=cube_m_only_k512_deferred_s2; label=tileops-spec ;;
     large-k512-batched) modes=(large-k512-batched-pair large-k512-batched-stages); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     profile-n4096) modes=(large-k512-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096]" >&2; exit 2 ;;
+    tiling-large) modes=(tiling); label=tileops-spec ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -62,18 +63,44 @@ for mode in "${modes[@]}"; do
         tilelang_output=()
         vllm_output=()
     fi
-    python bench_vllm_ascend.py --backend tilelang --projection "$projection" \
-        "${common[@]}" "${tilelang_output[@]}"
+    if [[ "$mode" != tiling ]]; then
+        python bench_vllm_ascend.py --backend tilelang --projection "$projection" \
+            "${common[@]}" "${tilelang_output[@]}"
+    fi
     if [[ "$mode" != large-m-only ]]; then
-        docker run --rm --pull=never --shm-size=1g "${devices[@]}" \
-            -e ASCEND_RT_VISIBLE_DEVICES \
-            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
-            -v /usr/local/dcmi:/usr/local/dcmi:ro \
-            -v "$(command -v npu-smi):/usr/local/bin/npu-smi:ro" \
-            -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
-            -v "$PWD:/fgw-mhc" -w /fgw-mhc --entrypoint python \
-            quay.io/ascend/vllm-ascend:v0.30.0-a5 bench_vllm_ascend.py \
-            --backend vllm "${common[@]}" "${vllm_output[@]}"
+        cann_env=()
+        vllm_args=("${common[@]}" "${vllm_output[@]}")
+        if [[ "$mode" == tiling ]]; then
+            cann_env=(-e ASCEND_GLOBAL_LOG_LEVEL=1 -e ASCEND_SLOG_PRINT_TO_STDOUT=1)
+            vllm_args=("${common[@]}" --large-k512-cases --tiling-only)
+        fi
+
+        run_vllm() {
+            docker run --rm --pull=never --shm-size=1g "${devices[@]}" \
+                "${cann_env[@]}" -e ASCEND_RT_VISIBLE_DEVICES \
+                -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+                -v /usr/local/dcmi:/usr/local/dcmi:ro \
+                -v "$(command -v npu-smi):/usr/local/bin/npu-smi:ro" \
+                -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
+                -v "$PWD:/fgw-mhc" -w /fgw-mhc --entrypoint python \
+                quay.io/ascend/vllm-ascend:v0.30.0-a5 bench_vllm_ascend.py \
+                --backend vllm "${vllm_args[@]}"
+        }
+
+        if [[ "$mode" == tiling ]]; then
+            log="$prefix-$(date +%Y%m%d-%H%M%S).log"
+            if ! run_vllm >"$log" 2>&1; then
+                tail -n 60 "$log" >&2
+                exit 1
+            fi
+            grep -E 'BEGIN vLLM HcPre|END vLLM HcPre|HcPre arch35 tiling decision' "$log" || true
+            if ! grep -q 'HcPre arch35 tiling decision' "$log"; then
+                echo "The runtime did not emit the HcPre tiling decision to stdout."
+            fi
+            echo "Full CANN log: $log"
+            continue
+        fi
+        run_vllm
     fi
     if [[ "$mode" == profile || "$mode" == large-k512-profile ]]; then
         cat "$profile_dir"/{tilelang,vllm}/"b$profile_batch-h2560"/unprofiled-pair.csv

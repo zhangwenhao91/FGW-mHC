@@ -162,12 +162,16 @@ def main():
     parser.add_argument("--large-tokens", action="store_true", help="Measure 256, 1024, and 4096 tokens at H=2560")
     parser.add_argument("--large-k512-cases", action="store_true", help="Use the 1024 and 4096 token K512 workloads")
     parser.add_argument("--pairs-per-event", type=int, default=1)
+    parser.add_argument("--tiling-only", action="store_true", help="Launch vLLM Pre once per case for CANN logging")
     parser.add_argument("--list-cases", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--backend", choices=("both", "tilelang", "vllm"), default="both")
     mode.add_argument("--merge", type=Path, nargs=2, metavar=("TILELANG_CSV", "VLLM_CSV"))
     parser.add_argument("--tileops-spec", action="store_true", help="Use TileOPs mHC manifest Sinkhorn settings")
     args = parser.parse_args()
+    if args.tiling_only and (args.backend != "vllm" or args.merge or args.profile_dir
+                             or args.split_stages or args.sweep_pairs):
+        parser.error("--tiling-only requires --backend vllm without timing modes")
     if args.large_k512_cases:
         args.large_tokens = True
         cases = LARGE_TOKEN_CASES[1:]
@@ -235,10 +239,10 @@ def main():
     torch.npu.set_device(device)
     eps = 0.02 if args.tileops_spec else 1e-6
     rng = torch.Generator().manual_seed(42)
-    output_context = nullcontext(sys.stdout) if args.profile_dir else args.output.open("w", encoding="utf-8", newline="")
+    output_context = nullcontext(sys.stdout) if args.profile_dir or args.tiling_only else args.output.open("w", encoding="utf-8", newline="")
     with output_context as output:
         writer = csv.writer(output)
-        if args.profile_dir:
+        if args.profile_dir or args.tiling_only:
             pass
         elif args.sweep_pairs:
             writer.writerow(("backend", "batch", "hidden", "sinkhorn_iters", "projection",
@@ -270,6 +274,13 @@ def main():
             scale = torch.ones(3, dtype=torch.float32, device=device)
             pre_args = (phi, x, bias, 1.0, 1.0, 1.0, args.sinkhorn_iters, eps)
             vllm_args = (vllm_x, vllm_phi, scale, bias, 4, args.sinkhorn_iters, 1e-6, eps)
+
+            if args.tiling_only:
+                print(f"BEGIN vLLM HcPre N={batch} H={hidden}", flush=True)
+                vllm_pre(*vllm_args)
+                torch.npu.synchronize()
+                print(f"END vLLM HcPre N={batch} H={hidden}", flush=True)
+                continue
 
             def tilelang_pair(trace=False):
                 if not trace:
