@@ -111,11 +111,11 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         sources = {}
 
-        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16):
+        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16, mad_k=0):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
                 projection_only=True, k_pipeline_stages=stages, a_ping_pong=a_ping_pong,
-                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows,
+                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows, mad_k_override=mad_k,
             )
 
             if args.dump_projection_code is not None:
@@ -144,7 +144,8 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
         if args.projection_m_tile_sweep:
             variants = (
                 ("projection_m16_k512", prepare(512, 2, accumulate_squares=True)),
-                ("projection_m256_k128", prepare(128, 2, accumulate_squares=True, rows=256)),
+                ("projection_m256_k128_mad64", prepare(128, 2, accumulate_squares=True, rows=256)),
+                ("projection_m256_k128_mad32", prepare(128, 2, accumulate_squares=True, rows=256, mad_k=32)),
             )
         elif args.profile_projection:
             if args.deferred_buffer_sweep:

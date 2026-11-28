@@ -532,7 +532,7 @@ def project_cube_m_only(
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
     projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False, compute_squares: bool = True,
-    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16,
+    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     assert not batch_coefficients or (accumulate_squares and not debug and not projection_only)
@@ -545,7 +545,9 @@ def project_cube_m_only(
     assert not a_ping_pong or splits % 2 == 0
     # L0C requires a zero-origin region. Bound L0A by splitting K, not M,
     # so the full M tile can accumulate into one compact L0C tile.
-    mad_k = min(chunk, 64 if rows == 256 else 256)
+    mad_k = mad_k_override or min(chunk, 64 if rows == 256 else 256)
+    assert chunk % mad_k == 0
+    assert not mad_k_override or (rows == 256 and mad_k == 32)
     row_tiles = (batch + rows - 1) // rows
     cores = min(row_tiles, 28)
     x: T.Tensor[(batch, width), T.bfloat16]
