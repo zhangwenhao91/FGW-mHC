@@ -180,6 +180,8 @@ def main():
                         help="Test whole-pair latency with several pair counts per NPU event")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES],
                         help="Limit the event batch-size sweep to one workload")
+    parser.add_argument("--compare-fresh-b4", action="store_true",
+                        help="Interleave the regular and fresh-output B4 TileLang paths in the sweep")
     parser.add_argument("--split-stages", action="store_true", help="Measure each backend’s native Pre and Post separately")
     parser.add_argument("--profile-dir", type=Path, help="Capture consecutive pair launches with the NPU profiler")
     parser.add_argument("--profile-batch", type=int)
@@ -228,6 +230,11 @@ def main():
         parser.error("--sweep-pairs requires a single backend and unprofiled pair execution")
     if args.sweep_pairs is not None and min(args.sweep_pairs) < 1:
         parser.error("pair counts must be positive")
+    if args.compare_fresh_b4 and (
+        args.backend != "tilelang" or args.batch != 4 or not args.sweep_pairs
+        or args.projection != "cube_full" or args.full_h_double_post
+    ):
+        parser.error("--compare-fresh-b4 requires a B4 TileLang cube_full sweep with default Post")
     if args.batch is not None and args.sweep_pairs is None:
         parser.error("--batch requires --sweep-pairs")
     if args.merge:
@@ -421,24 +428,40 @@ def main():
             if args.sweep_pairs:
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair
                 projection = projection_label if args.backend == "tilelang" else ""
-                sizes = tuple(dict.fromkeys(args.sweep_pairs))
-                for order, counts in (("forward", sizes), ("reverse", sizes[::-1])):
-                    for count in counts:
-                        def submit():
-                            result = None
-                            for _ in range(count):
-                                result = pair()
-                            return result
+                candidates = ((projection, pair),)
+                if args.compare_fresh_b4:
+                    from bench_cube_b2 import prepare_fresh_pair
 
-                        elapsed = time_us(pair if count == 1 else submit, torch, args.warmup, args.repeat)
-                        if not math.isfinite(elapsed) or elapsed <= 0:
-                            raise RuntimeError(f"Invalid event time for {count} pairs: {elapsed}")
-                        per_pair = elapsed / count
-                        writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters, projection,
-                                         count, order, f"{per_pair:.6f}"))
-                        output.flush()
-                        print(f"{args.backend} B={batch} H={hidden} {count} pairs/event {order}: "
-                              f"{per_pair:.3f} us/pair", flush=True)
+                    fresh = prepare_fresh_pair(pre_args, layer_out, route)
+
+                    def fresh_pair():
+                        _, layer_in, post, output = fresh(phi, x, bias, layer_out)
+                        return layer_in, post, output
+
+                    torch.testing.assert_close(fresh_pair(), expected, atol=0.01, rtol=0.01)
+                    candidates += (("cube_full_fresh", fresh_pair),)
+
+                sizes = tuple(dict.fromkeys(args.sweep_pairs))
+                for order, counts, paths in (("forward", sizes, candidates),
+                                             ("reverse", sizes[::-1], candidates[::-1])):
+                    for count in counts:
+                        for label, op in paths:
+                            def submit():
+                                result = None
+                                for _ in range(count):
+                                    result = op()
+                                return result
+
+                            elapsed = time_us(op if count == 1 else submit, torch, args.warmup, args.repeat)
+                            if not math.isfinite(elapsed) or elapsed <= 0:
+                                raise RuntimeError(f"Invalid event time for {count} pairs: {elapsed}")
+                            per_pair = elapsed / count
+                            writer.writerow((args.backend, batch, hidden, args.sinkhorn_iters, label,
+                                             count, order, f"{per_pair:.6f}"))
+                            output.flush()
+                            name = label if args.compare_fresh_b4 else args.backend
+                            print(f"{name} B={batch} H={hidden} {count} pairs/event {order}: "
+                                  f"{per_pair:.3f} us/pair", flush=True)
                 continue
 
             if args.profile_dir:

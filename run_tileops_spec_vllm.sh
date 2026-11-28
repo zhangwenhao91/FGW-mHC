@@ -9,6 +9,7 @@ case "${2:-all}" in
     tuned-pair) modes=(pair); projection=tileops_tuned; label=tileops-spec-tuned ;;
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
+    compare-b4) modes=(sweep); projection=cube_full; label=tileops-spec-compare-b4 ;;
     large-pair) modes=(large-full large-m-only); projection=cube_full; label=tileops-spec ;;
     large-stages) modes=(large-stages); projection=cube_m_only; label=tileops-spec ;;
     large-k512-pair) modes=(large-k512-pair); projection=cube_m_only_k512; label=tileops-spec ;;
@@ -20,7 +21,7 @@ case "${2:-all}" in
     tiling-large) modes=(tiling); label=tileops-spec ;;
     large-k512-post-double) modes=(large-k512-post-double); projection=cube_m_only_k512_batched; label=tileops-spec ;;
     profile-n4096-post-double) modes=(large-k512-post-double-profile); projection=cube_m_only_k512_batched; label=tileops-spec ;;
-    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [card] [all|tuned-pair|profile-b4|sweep-b4|compare-b4|large-pair|large-stages|large-k512-pair|large-k512-stages|large-k512-deferred-pair|large-k512-s2|large-k512-batched|profile-n4096|tiling-large|large-k512-post-double|profile-n4096-post-double]" >&2; exit 2 ;;
 esac
 export ASCEND_RT_VISIBLE_DEVICES="$card"
 devices=(--device /dev/davinci_manager)
@@ -54,6 +55,9 @@ for mode in "${modes[@]}"; do
         fi
     fi
     tilelang_args=()
+    if [[ "${2:-all}" == compare-b4 ]]; then
+        tilelang_args+=(--compare-fresh-b4)
+    fi
     if [[ "$mode" == large-k512-post-double || "$mode" == large-k512-post-double-profile ]]; then
         common+=(--n4096-only)
         merge_args+=(--n4096-only)
@@ -122,6 +126,25 @@ for mode in "${modes[@]}"; do
     fi
     if [[ "$mode" == sweep ]]; then
         cat "$prefix-tilelang.csv" "$prefix-vllm.csv"
+        if [[ "${2:-all}" == compare-b4 ]]; then
+            python - "$prefix-tilelang.csv" "$prefix-vllm.csv" <<'PY'
+import csv
+from statistics import mean
+import sys
+
+def times(path):
+    with open(path, newline="") as source:
+        return {(row["projection"], row["order"]): float(row["pair_us"])
+                for row in csv.DictReader(source) if row["pairs_per_event"] == "32"}
+
+fgw, vllm = map(times, sys.argv[1:])
+orders = ("forward", "reverse")
+baseline = mean(vllm["", order] for order in orders)
+for name in ("cube_full", "cube_full_fresh"):
+    latency = mean(fgw[name, order] for order in orders)
+    print(f"{name}: {latency:.3f} us/pair, vLLM {baseline:.3f} us/pair, {baseline / latency:.3f}x")
+PY
+        fi
         continue
     fi
     python bench_vllm_ascend.py --merge "$prefix-tilelang.csv" "$baseline" \
