@@ -3,7 +3,9 @@
 import argparse
 from collections import defaultdict
 from itertools import permutations
+from pathlib import Path
 import csv
+from difflib import unified_diff
 import math
 from statistics import median
 
@@ -71,11 +73,23 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
         expected_projection = flat @ phi
         expected_squares = flat.square().sum(-1)
 
+        sources = {}
+
         def prepare(chunk, stages):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
                 projection_only=True, k_pipeline_stages=stages,
             )
+
+            if args.dump_projection_code is not None:
+                source = kernel.get_kernel_source()
+                if not source:
+                    raise RuntimeError(f"TileLang returned no device source for {stages} pipeline stages")
+                path = args.dump_projection_code / f"projection_k{chunk}_stages{stages}.cpp"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source, encoding="utf-8")
+                sources[stages] = (path, source)
+                print(f"Generated device source: {path}", flush=True)
 
             def run():
                 kernel(x, phi, bias, post, residual, layer, projection)
@@ -87,6 +101,16 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         if args.projection_buffer_sweep:
             variants = tuple((f"projection_k512_stages{stages}", prepare(512, stages)) for stages in (1, 2))
+            if sources:
+                first_path, first = sources[1]
+                second_path, second = sources[2]
+                diff = "".join(unified_diff(
+                    first.splitlines(keepends=True), second.splitlines(keepends=True),
+                    fromfile=first_path.name, tofile=second_path.name,
+                ))
+                diff_path = args.dump_projection_code / "pipeline.diff"
+                diff_path.write_text(diff, encoding="utf-8")
+                print(f"Generated device sources {'differ' if diff else 'are identical'}. Diff: {diff_path}", flush=True)
         else:
             variants = tuple((f"projection_k{chunk}", prepare(chunk, 1)) for chunk in (256, 512))
     else:
@@ -139,6 +163,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--simd-reduce", action="store_true", help="Compare baseline and SIMD partial reduction")
     parser.add_argument("--ablate-m-only", action="store_true", help="Compare full Pre, coefficients, and projection at N=1024 and 4096")
+    parser.add_argument("--dump-projection-code", type=Path, help="Save the device sources and diff for the buffer sweep")
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
     parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
@@ -150,6 +175,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.dump_projection_code is not None and not args.projection_buffer_sweep:
+        parser.error("--dump-projection-code requires --projection-buffer-sweep")
     if args.projection_buffer_sweep and (not args.ablate_m_only or args.projection_k_sweep):
         parser.error("--projection-buffer-sweep requires --ablate-m-only without --projection-k-sweep")
     if args.ablate_k512 and (not args.ablate_m_only or args.projection_k_sweep):
