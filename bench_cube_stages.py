@@ -111,11 +111,11 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         sources = {}
 
-        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16, mad_k=0, separate_nz=False, block_nz=False):
+        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16, mad_k=0, separate_nz=False, block_nz=False, weight_nk=False):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
                 projection_only=True, k_pipeline_stages=stages, a_ping_pong=a_ping_pong,
-                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows, mad_k_override=mad_k, separate_nz=separate_nz, block_nz=block_nz,
+                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows, mad_k_override=mad_k, separate_nz=separate_nz, block_nz=block_nz, weight_nk=weight_nk,
             )
 
             if args.dump_projection_code is not None:
@@ -129,8 +129,13 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 sources[stages, a_ping_pong] = (path, source)
                 print(f"Generated device source: {path}", flush=True)
 
+            weight = phi
+            if weight_nk:
+                weight = phi.new_zeros((32, width))
+                weight[:24].copy_(phi.transpose(0, 1))
+
             def run():
-                kernel(x, phi, bias, post, residual, layer, projection)
+                kernel(x, weight, bias, post, residual, layer, projection)
 
             run()
             try:
@@ -195,7 +200,12 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 ("projection_m256_k128_mad32", prepare(128, 2, accumulate_squares=True, rows=256, mad_k=32)),
             )
         elif args.profile_projection:
-            if args.compare_block_nz:
+            if args.compare_weight_layout:
+                variants = (
+                    ("projection_weight_kn", prepare(512, 2, accumulate_squares=True)),
+                    ("projection_weight_nk", prepare(512, 2, accumulate_squares=True, weight_nk=True)),
+                )
+            elif args.compare_block_nz:
                 variants = (
                     ("projection_fused_nz", prepare(512, 2, accumulate_squares=True)),
                     ("projection_block_nz", prepare(512, 2, accumulate_squares=True, separate_nz=True, block_nz=True)),
@@ -319,6 +329,7 @@ def main():
     parser.add_argument("--accumulate-squares", action="store_true", help="Compare per-window and deferred square reductions")
     parser.add_argument("--compare-squares", action="store_true", help="Also profile projection with squared sum disabled")
     parser.add_argument("--deferred-buffer-sweep", action="store_true", help="Profile one and two K stages with deferred square reduction")
+    parser.add_argument("--compare-weight-layout", action="store_true", help="Compare KxN and prepacked NxK projection weights")
     parser.add_argument("--compare-block-nz", action="store_true", help="Compare fused NZ and vLLM-style block gather")
     parser.add_argument("--compare-separate-nz", action="store_true", help="Compare fused and separate AIV NZ conversion")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
@@ -334,6 +345,11 @@ def main():
         parser.error("--accumulate-squares requires --profile-projection")
     if args.compare_squares and not args.profile_projection:
         parser.error("--compare-squares requires --profile-projection")
+    if args.compare_weight_layout and (
+        not args.profile_projection or args.compare_block_nz or args.compare_separate_nz
+        or args.accumulate_squares or args.compare_squares or args.deferred_buffer_sweep
+    ):
+        parser.error("--compare-weight-layout requires --profile-projection without other projection comparisons")
     if args.compare_block_nz and args.compare_separate_nz:
         parser.error("--compare-block-nz cannot be combined with --compare-separate-nz")
     if (args.compare_separate_nz or args.compare_block_nz) and (
