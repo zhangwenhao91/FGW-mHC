@@ -148,6 +148,47 @@ def _normalize_simd(logits_ub, weights_ub, post_ub, repeat, eps):
 
 
 @T.macro
+def _normalize_token(
+    logits, logit_offset, square_sum, bias_ub, weights_ub, weight_offset, post_ub, post_offset,
+    width, repeat, eps, alpha_pre, alpha_post, alpha_res,
+):
+    residual = T.alloc_local((16,), T.float32)
+    norm = T.sqrt(square_sum / width) + 0.0001
+    for i in T.serial(4):
+        pre = alpha_pre * logits[logit_offset + i] / norm + bias_ub[i]
+        post = alpha_post * logits[logit_offset + 4 + i] / norm + bias_ub[4 + i]
+        weights_ub[weight_offset + i] = 1.0 / (1.0 + T.exp(-pre))
+        post_ub[post_offset + i] = 2.0 / (1.0 + T.exp(-post))
+    for i in T.serial(4):
+        row = i * 4
+        for j in T.serial(4):
+            q = 8 + i * 4 + j
+            residual[row + j] = alpha_res * logits[logit_offset + q] / norm + bias_ub[q]
+        row_max = T.alloc_var(T.float32, init=residual[row])
+        for j in T.serial(1, 4):
+            row_max = T.max(row_max, residual[row + j])
+        for j in T.serial(4):
+            residual[row + j] = T.exp(residual[row + j] - row_max)
+    for iteration in T.serial(repeat):
+        for i in T.serial(4):
+            row_sum = T.alloc_var(T.float32, init=0.0)
+            for j in T.serial(4):
+                row_sum += residual[i * 4 + j]
+            for j in T.serial(4):
+                residual[i * 4 + j] /= row_sum + eps
+        for j in T.serial(4):
+            col_sum = T.alloc_var(T.float32, init=0.0)
+            for i in T.serial(4):
+                col_sum += residual[i * 4 + j]
+            for i in T.serial(4):
+                residual[i * 4 + j] /= col_sum + eps
+    for i in T.serial(16):
+        weights_ub[weight_offset + 4 + i] = residual[i]
+    for i in T.serial(20, 24):
+        weights_ub[weight_offset + i] = 0.0
+
+
+@T.macro
 def _compute_weights(
     partial_ub, squares_ub, bias_ub, totals, weights_ub, post_ub, logits_ub,
     width, splits, repeat, eps, alpha_pre, alpha_post, alpha_res, cube, fused, simd_weights,
@@ -195,41 +236,10 @@ def _compute_weights(
     else:
         with T.SimtVF(threads=32):
             for lane in T.Parallel(1):
-                # Sinkhorn is serial within this lane. Publish only final weights to UB.
-                residual = T.alloc_local((16,), T.float32)
-                norm = T.sqrt(totals[24] / width) + 0.0001
-                for i in T.serial(4):
-                    pre = alpha_pre * totals[i] / norm + bias_ub[i]
-                    post = alpha_post * totals[4 + i] / norm + bias_ub[4 + i]
-                    weights_ub[i] = 1.0 / (1.0 + T.exp(-pre))
-                    post_ub[i] = 2.0 / (1.0 + T.exp(-post))
-                for i in T.serial(4):
-                    row = i * 4
-                    for j in T.serial(4):
-                        q = 8 + i * 4 + j
-                        residual[row + j] = alpha_res * totals[q] / norm + bias_ub[q]
-                    row_max = T.alloc_var(T.float32, init=residual[row])
-                    for j in T.serial(1, 4):
-                        row_max = T.max(row_max, residual[row + j])
-                    for j in T.serial(4):
-                        residual[row + j] = T.exp(residual[row + j] - row_max)
-                for iteration in T.serial(repeat):
-                    for i in T.serial(4):
-                        row_sum = T.alloc_var(T.float32, init=0.0)
-                        for j in T.serial(4):
-                            row_sum += residual[i * 4 + j]
-                        for j in T.serial(4):
-                            residual[i * 4 + j] /= row_sum + eps
-                    for j in T.serial(4):
-                        col_sum = T.alloc_var(T.float32, init=0.0)
-                        for i in T.serial(4):
-                            col_sum += residual[i * 4 + j]
-                        for i in T.serial(4):
-                            residual[i * 4 + j] /= col_sum + eps
-                for i in T.serial(16):
-                    weights_ub[4 + i] = residual[i]
-                for i in T.serial(20, 24):
-                    weights_ub[i] = 0.0
+                _normalize_token(
+                    totals, 0, totals[24], bias_ub, weights_ub, 0, post_ub, 0,
+                    width, repeat, eps, alpha_pre, alpha_post, alpha_res,
+                )
 
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
@@ -522,9 +532,10 @@ def project_cube_m_only(
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
     projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False, compute_squares: bool = True,
-    accumulate_squares: bool = False,
+    accumulate_squares: bool = False, batch_coefficients: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
+    assert not batch_coefficients or (coefficients_only and accumulate_squares and not debug and not projection_only)
     assert projection_only or compute_squares
     assert not accumulate_squares or (compute_squares and not a_ping_pong and k_pipeline_stages in (1, 2))
     rows = 16
@@ -559,6 +570,11 @@ def project_cube_m_only(
         acc = T.alloc_l0c((rows, cols), T.float32)
 
         raw_ub = T.alloc_shared((half, cols), T.float32)
+        if batch_coefficients:
+            row_squares = T.alloc_shared((half, 8), T.float32)
+            row_weights = T.alloc_shared((half * 24,), T.float32)
+            row_post = T.alloc_shared((half * 8,), T.float32)
+            row_logits = T.reshape(raw_ub, (half * cols,))
         sum_ub = T.alloc_shared((1, 8), T.float32)
         bias_ub = T.alloc_shared((24,), T.float32)
         totals = T.alloc_shared((32,), T.float32)
@@ -591,43 +607,66 @@ def project_cube_m_only(
                     )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
-            for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
-                token = vector_m + row
-                if accumulate_squares:
-                    with T.SimdVF():
-                        full = S.pset(32)
-                        first = S.pset(32, "PAT_VL1")
-                        eight = S.pset(32, "PAT_VL8")
-                        zero = S.vdup(T.float32(0), T.float32, full)
+            if batch_coefficients:
+                row_count = T.min(T.max(batch - vector_m, 0), half)
+                with T.SimdVF():
+                    full = S.pset(32)
+                    first = S.pset(32, "PAT_VL1")
+                    eight = S.pset(32, "PAT_VL8")
+                    zero = S.vdup(T.float32(0), T.float32, full)
+                    for row in T.serial(row_count):
                         total = S.vcadd(S.vld(squares_ub[0, row, 0]), full)
-                        S.vsts(sum_ub[0, 0], S.vsel(total, zero, first), eight)
-                elif compute_squares:
-                    with T.SimtVF(threads=32):
-                        for lane in T.Parallel(8):
-                            value = T.alloc_var(T.float32, init=0.0)
-                            if lane == 0:
-                                for part in T.serial(splits):
-                                    value += squares_ub[part, row, 0]
-                            sum_ub[0, lane] = value
-                if debug or projection_only:
-                    T.copy(raw_ub[row, 0:24], trace[token, 0:24])
-                    if compute_squares:
-                        T.copy(sum_ub[0, 0:8], trace[token, 24:32])
-                if not projection_only:
-                    _compute_weights(
-                        raw_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,
-                        width, 1, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, False, row,
-                    )
-                    if coefficients_only:
-                        T.copy(weights_ub, trace[token, 0:24])
-                    else:
-                        for column_tile in T.serial(hidden // tile):
-                            offset = column_tile * tile
-                            T.copy(streams[token, 0, offset], streams_ub)
-                            _apply_weights(streams_ub, weights_ub, res_ub, layer_ub, tile, 4)
-                            T.copy(res_ub, x_res[token, 0, offset])
-                            T.copy(layer_ub, x_layer[token, offset])
-                    T.copy(post_ub[0:4], h_post[token, 0])
+                        S.vsts(row_squares[row, 0], S.vsel(total, zero, first), eight)
+                with T.SimtVF(threads=32):
+                    for row in T.Parallel(half):
+                        if row < row_count:
+                            _normalize_token(
+                                row_logits, row * cols, row_squares[row, 0], bias_ub,
+                                row_weights, row * 24, row_post, row * 8,
+                                width, repeat, eps, alpha_pre, alpha_post, alpha_res,
+                            )
+                for row in T.serial(row_count):
+                    token = vector_m + row
+                    T.copy(row_weights[row * 24:row * 24 + 24], trace[token, 0:24])
+                    T.copy(row_post[row * 8:row * 8 + 4], h_post[token, 0:4])
+            else:
+                for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
+                    token = vector_m + row
+                    if accumulate_squares:
+                        with T.SimdVF():
+                            full = S.pset(32)
+                            first = S.pset(32, "PAT_VL1")
+                            eight = S.pset(32, "PAT_VL8")
+                            zero = S.vdup(T.float32(0), T.float32, full)
+                            total = S.vcadd(S.vld(squares_ub[0, row, 0]), full)
+                            S.vsts(sum_ub[0, 0], S.vsel(total, zero, first), eight)
+                    elif compute_squares:
+                        with T.SimtVF(threads=32):
+                            for lane in T.Parallel(8):
+                                value = T.alloc_var(T.float32, init=0.0)
+                                if lane == 0:
+                                    for part in T.serial(splits):
+                                        value += squares_ub[part, row, 0]
+                                sum_ub[0, lane] = value
+                    if debug or projection_only:
+                        T.copy(raw_ub[row, 0:24], trace[token, 0:24])
+                        if compute_squares:
+                            T.copy(sum_ub[0, 0:8], trace[token, 24:32])
+                    if not projection_only:
+                        _compute_weights(
+                            raw_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,
+                            width, 1, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, False, row,
+                        )
+                        if coefficients_only:
+                            T.copy(weights_ub, trace[token, 0:24])
+                        else:
+                            for column_tile in T.serial(hidden // tile):
+                                offset = column_tile * tile
+                                T.copy(streams[token, 0, offset], streams_ub)
+                                _apply_weights(streams_ub, weights_ub, res_ub, layer_ub, tile, 4)
+                                T.copy(res_ub, x_res[token, 0, offset])
+                                T.copy(layer_ub, x_layer[token, offset])
+                        T.copy(post_ub[0:4], h_post[token, 0])
 
 @tilelang.jit(target="ascend", execution_backend="tvm_ffi")
 def mix(

@@ -197,7 +197,19 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
         torch.testing.assert_close(projection[:, :24], flat @ phi, atol=0.01, rtol=0.01)
         torch.testing.assert_close(projection[:, 24], flat.square().sum(-1), atol=0.01, rtol=0.01)
 
-        variants = (("full_pre", run_full), ("coefficients_only", run_ablated), ("projection_only", run_project))
+        if args.batch_coefficients:
+            expected_weights = weights[:, :20].clone()
+            batched = _compile("project_cube_m_only", **config, coefficients_only=True, batch_coefficients=True)
+
+            def run_batched():
+                batched(x, phi, bias, post, residual, layer, weights)
+
+            run_batched()
+            torch.testing.assert_close(weights[:, :20], expected_weights, atol=0.001, rtol=0.001)
+            torch.testing.assert_close(post, expected[2], atol=0.01, rtol=0.01)
+            variants = (("coefficients_only", run_ablated), ("batched_coefficients", run_batched))
+        else:
+            variants = (("full_pre", run_full), ("coefficients_only", run_ablated), ("projection_only", run_project))
     samples = defaultdict(list)
     count = args.launches_per_event
     orders = tuple(permutations(variants))
@@ -236,6 +248,7 @@ def main():
     parser.add_argument("--dump-projection-code", type=Path, help="Save the device sources and diff for the buffer sweep")
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
+    parser.add_argument("--batch-coefficients", action="store_true", help="Compare per-token and batched SIMT coefficient generation")
     parser.add_argument("--ablate-deferred-s2", action="store_true", help="Ablate the two-stage deferred K512 Pre")
     parser.add_argument("--ablate-k512", action="store_true", help="Use K512 for the M-only Pre ablation")
     parser.add_argument("--accumulate-squares", action="store_true", help="Compare per-window and deferred square reductions")
@@ -268,6 +281,8 @@ def main():
         parser.error("--deferred-buffer-sweep requires --profile-projection without other square comparisons")
     if args.projection_buffer_sweep and (not args.ablate_m_only or args.projection_k_sweep):
         parser.error("--projection-buffer-sweep requires --ablate-m-only without --projection-k-sweep")
+    if args.batch_coefficients and not args.ablate_deferred_s2:
+        parser.error("--batch-coefficients requires --ablate-deferred-s2")
     if args.ablate_deferred_s2 and (
         not args.ablate_k512 or args.profile_projection or args.projection_buffer_sweep or args.projection_k_sweep
     ):
