@@ -545,9 +545,11 @@ def project_cube_m_only(
     assert not a_ping_pong or splits % 2 == 0
     # L0C requires a zero-origin region. Bound L0A by splitting K, not M,
     # so the full M tile can accumulate into one compact L0C tile.
-    mad_k = mad_k_override or min(chunk, 64 if rows == 256 else 256)
+    assert mad_k_override in (0, 32)
+    if mad_k_override == 32:
+        assert rows == 256
+    mad_k = 32 if mad_k_override == 32 else min(chunk, 64 if rows == 256 else 256)
     assert chunk % mad_k == 0
-    assert not mad_k_override or (rows == 256 and mad_k == 32)
     row_tiles = (batch + rows - 1) // rows
     cores = min(row_tiles, 28)
     x: T.Tensor[(batch, width), T.bfloat16]
