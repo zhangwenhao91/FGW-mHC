@@ -32,6 +32,17 @@ def _run_kernel(name, kernel, *args):
     kernel(*args)
 
 
+@lru_cache(maxsize=64)
+def _b4_launcher(kernel, device):
+    adapter = getattr(kernel, "adapter", None)
+    prepare = getattr(adapter, "_prepare_torch_device", None)
+    export = getattr(adapter, "get_exportable_executable", None)
+    if prepare is None or export is None:
+        return kernel
+    prepare(device)
+    return export()["main"]
+
+
 @lru_cache(maxsize=32)
 def _b4_pre_kernel(alpha_pre, alpha_post, alpha_res, repeat, eps):
     return _compile(
@@ -50,7 +61,9 @@ def _b4_pre(phi, x, bias, kernel, launch):
     layer = x.new_empty((4, 2560))
     weights = bias.new_empty((4, 4))
     if launch is _run_kernel:
-        kernel(x, phi, partial, squares, partial, squares, bias, scratch, weights, residual, layer)
+        _b4_launcher(kernel, x.device)(
+            x, phi, partial, squares, partial, squares, bias, scratch, weights, residual, layer,
+        )
     else:
         launch("pre", kernel, x, phi, partial, squares, partial, squares,
                bias, scratch, weights, residual, layer)
@@ -240,7 +253,7 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
         kernel = _b4_post_kernel()
         residual = x_res.view(4, 4, 2560)
         if _launch is _run_kernel:
-            kernel(x_layer_out, h_post, residual, out)
+            _b4_launcher(kernel, device)(x_layer_out, h_post, residual, out)
         else:
             _launch("post", kernel, x_layer_out, h_post, residual, out)
         return out.view(4, 10240)

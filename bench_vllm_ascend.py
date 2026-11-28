@@ -182,6 +182,8 @@ def main():
                         help="Limit the event batch-size sweep to one workload")
     parser.add_argument("--compare-fresh-b4", action="store_true",
                         help="Interleave the regular and fresh-output B4 TileLang paths in the sweep")
+    parser.add_argument("--verify-b4-stream", action="store_true",
+                        help="Check the normal B4 calls on a non-default NPU stream before timing")
     parser.add_argument("--compare-direct-b4", action="store_true",
                         help="Include fresh outputs with the exported TileLang launchers")
     parser.add_argument("--split-stages", action="store_true", help="Measure each backend’s native Pre and Post separately")
@@ -232,6 +234,11 @@ def main():
         parser.error("--sweep-pairs requires a single backend and unprofiled pair execution")
     if args.sweep_pairs is not None and min(args.sweep_pairs) < 1:
         parser.error("pair counts must be positive")
+    if args.verify_b4_stream and (
+        args.backend != "tilelang" or args.batch != 4 or not args.sweep_pairs
+        or args.projection != "cube_full" or args.full_h_double_post
+    ):
+        parser.error("--verify-b4-stream requires a B4 TileLang cube_full sweep with default Post")
     if args.compare_direct_b4 and not args.compare_fresh_b4:
         parser.error("--compare-direct-b4 requires --compare-fresh-b4")
     if args.compare_fresh_b4 and (
@@ -428,6 +435,24 @@ def main():
                     raise RuntimeError(f"vLLM AscendC failed for B={batch}, hidden={hidden}: {exc}") from exc
                 if any(not torch.isfinite(tensor).all().item() for tensor in baseline):
                     raise RuntimeError(f"Non-finite vLLM AscendC output for B={batch}, hidden={hidden}")
+
+            if args.verify_b4_stream:
+                expected_pre = residual_ref, layer_ref, post_ref
+                stream = torch.npu.Stream(device=device)
+                stream.wait_stream(torch.npu.current_stream(device))
+                with torch.npu.stream(stream):
+                    first = mhc_pre(*pre_args, projection=route)
+                    first_out = mhc_post(layer_out, first[2], first[0])
+                    second = mhc_pre(*pre_args, projection=route)
+                    second_out = mhc_post(layer_out, second[2], second[0])
+                stream.synchronize()
+                for outputs in ((*first, first_out), (*second, second_out)):
+                    torch.testing.assert_close(outputs, (*expected_pre, expected[2]), atol=0.01, rtol=0.01)
+                if any(a.data_ptr() == b.data_ptr() for a, b in
+                       zip((*first, first_out), (*second, second_out), strict=True)):
+                    raise RuntimeError("B4 normal calls reused a live output on the non-default stream")
+                del first, second, first_out, second_out, outputs
+                print("B4 non-default stream and fresh outputs passed", flush=True)
 
             if args.sweep_pairs:
                 pair = tilelang_pair if args.backend == "tilelang" else vllm_pair

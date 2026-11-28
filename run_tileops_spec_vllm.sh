@@ -66,6 +66,9 @@ for mode in "${modes[@]}"; do
         fi
     fi
     tilelang_args=()
+    if [[ "${2:-all}" == validate-b4 ]]; then
+        tilelang_args+=(--verify-b4-stream)
+    fi
     if [[ "${2:-all}" == compare-b4 || "${2:-all}" == direct-b4 ]]; then
         tilelang_args+=(--compare-fresh-b4)
         if [[ "${2:-all}" == direct-b4 ]]; then
