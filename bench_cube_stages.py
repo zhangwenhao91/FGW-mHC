@@ -111,11 +111,11 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
 
         sources = {}
 
-        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16, mad_k=0, separate_nz=False, block_nz=False, weight_nk=False):
+        def prepare(chunk, stages, a_ping_pong=False, compute_squares=True, accumulate_squares=False, rows=16, mad_k=0, separate_nz=False, block_nz=False, weight_nk=False, l0_ping_pong=False):
             kernel = _compile(
                 "project_cube_m_only", **(config | {"chunk": chunk}),
                 projection_only=True, k_pipeline_stages=stages, a_ping_pong=a_ping_pong,
-                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows, mad_k_override=mad_k, separate_nz=separate_nz, block_nz=block_nz, weight_nk=weight_nk,
+                compute_squares=compute_squares, accumulate_squares=accumulate_squares, rows=rows, mad_k_override=mad_k, separate_nz=separate_nz, block_nz=block_nz, weight_nk=weight_nk, l0_ping_pong=l0_ping_pong,
             )
 
             if args.dump_projection_code is not None:
@@ -123,6 +123,8 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 if not source:
                     raise RuntimeError(f"TileLang returned no device source for {stages} pipeline stages")
                 suffix = "_a_ping_pong" if a_ping_pong else "_deferred" if accumulate_squares else ""
+                if l0_ping_pong:
+                    suffix += "_l0_ping_pong"
                 path = args.dump_projection_code / f"projection_k{chunk}_stages{stages}{suffix}.cpp"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source, encoding="utf-8")
@@ -200,7 +202,12 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 ("projection_m256_k128_mad32", prepare(128, 2, accumulate_squares=True, rows=256, mad_k=32)),
             )
         elif args.profile_projection:
-            if args.compare_weight_layout:
+            if args.compare_l0_ping_pong:
+                variants = (
+                    ("projection_l0_single", prepare(512, 2, accumulate_squares=True)),
+                    ("projection_l0_ping_pong", prepare(512, 2, accumulate_squares=True, l0_ping_pong=True)),
+                )
+            elif args.compare_weight_layout:
                 variants = (
                     ("projection_weight_kn", prepare(512, 2, accumulate_squares=True)),
                     ("projection_weight_nk", prepare(512, 2, accumulate_squares=True, weight_nk=True)),
@@ -329,6 +336,7 @@ def main():
     parser.add_argument("--accumulate-squares", action="store_true", help="Compare per-window and deferred square reductions")
     parser.add_argument("--compare-squares", action="store_true", help="Also profile projection with squared sum disabled")
     parser.add_argument("--deferred-buffer-sweep", action="store_true", help="Profile one and two K stages with deferred square reduction")
+    parser.add_argument("--compare-l0-ping-pong", action="store_true", help="Compare one and two L0 operand slots")
     parser.add_argument("--compare-weight-layout", action="store_true", help="Compare KxN and prepacked NxK projection weights")
     parser.add_argument("--compare-block-nz", action="store_true", help="Compare fused NZ and vLLM-style block gather")
     parser.add_argument("--compare-separate-nz", action="store_true", help="Compare fused and separate AIV NZ conversion")
@@ -345,6 +353,11 @@ def main():
         parser.error("--accumulate-squares requires --profile-projection")
     if args.compare_squares and not args.profile_projection:
         parser.error("--compare-squares requires --profile-projection")
+    if args.compare_l0_ping_pong and (
+        not args.profile_projection or args.compare_weight_layout or args.compare_block_nz
+        or args.compare_separate_nz or args.accumulate_squares or args.compare_squares or args.deferred_buffer_sweep
+    ):
+        parser.error("--compare-l0-ping-pong requires --profile-projection without other projection comparisons")
     if args.compare_weight_layout and (
         not args.profile_projection or args.compare_block_nz or args.compare_separate_nz
         or args.accumulate_squares or args.compare_squares or args.deferred_buffer_sweep
@@ -362,8 +375,8 @@ def main():
         parser.error("--profile-projection requires --ablate-m-only without a projection sweep")
     if args.projection_a_ping_pong and not args.projection_buffer_sweep:
         parser.error("--projection-a-ping-pong requires --projection-buffer-sweep")
-    if args.dump_projection_code is not None and not (args.projection_buffer_sweep or args.deferred_buffer_sweep):
-        parser.error("--dump-projection-code requires a buffer sweep")
+    if args.dump_projection_code is not None and not (args.projection_buffer_sweep or args.deferred_buffer_sweep or args.compare_l0_ping_pong):
+        parser.error("--dump-projection-code requires a buffer comparison")
     if args.deferred_buffer_sweep and (
         not args.profile_projection or args.accumulate_squares or args.compare_squares
     ):
