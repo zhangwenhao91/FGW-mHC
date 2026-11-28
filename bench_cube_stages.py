@@ -104,7 +104,7 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     post = bias.new_empty((batch, 4))
     weights = bias.new_empty((batch, 24))
     projection = bias.new_empty((batch, 32))
-    if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection or args.projection_m_tile_sweep:
+    if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection or args.projection_m_tile_sweep or args.projection_mk_compare:
         flat = x.float()
         expected_projection = flat @ phi
         expected_squares = flat.square().sum(-1)
@@ -141,7 +141,47 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
                 )
             return run
 
-        if args.projection_m_tile_sweep:
+        if args.projection_mk_compare:
+            baseline = prepare(512, 2, accumulate_squares=True)
+            split_k = 1536
+            shards = (width + split_k - 1) // split_k
+            partials = bias.new_empty((shards * batch, 32))
+            kernel = _compile(
+                "project_cube_m_only", **(config | {"chunk": 128}),
+                rows=256, mad_k_override=32, split_k=split_k, projection_only=True,
+                accumulate_squares=True, k_pipeline_stages=2,
+            )
+            partial_view = partials.view(shards, batch, 32)
+            reduced = bias.new_empty((batch, 32))
+
+            def run_partials():
+                kernel(x, phi, bias, post, residual, layer, partials)
+
+            def reduce_partials():
+                torch.sum(partial_view, dim=0, out=reduced)
+
+            def run_mk():
+                run_partials()
+                reduce_partials()
+
+            run_mk()
+            for shard in range(shards):
+                start = shard * split_k
+                stop = min(start + split_k, width)
+                torch.testing.assert_close(
+                    partial_view[shard, :, :24], flat[:, start:stop] @ phi[start:stop], atol=0.01, rtol=0.01,
+                )
+                torch.testing.assert_close(
+                    partial_view[shard, :, 24], flat[:, start:stop].square().sum(-1), atol=0.01, rtol=0.001,
+                )
+            torch.testing.assert_close(reduced[:, :24], expected_projection, atol=0.01, rtol=0.01)
+            torch.testing.assert_close(reduced[:, 24], expected_squares, atol=0.01, rtol=0.001)
+            variants = (
+                ("projection_m16_k512", baseline),
+                ("projection_mk_partials", run_partials),
+                ("projection_mk_with_torch_reduce", run_mk),
+            )
+        elif args.projection_m_tile_sweep:
             variants = (
                 ("projection_m16_k512", prepare(512, 2, accumulate_squares=True)),
                 ("projection_m256_k128_mad64", prepare(128, 2, accumulate_squares=True, rows=256)),
@@ -253,6 +293,7 @@ def main():
     parser.add_argument("--projection-a-ping-pong", action="store_true", help="Add an explicit two-slot activation L1 variant")
     parser.add_argument("--dump-projection-code", type=Path, help="Save the device sources and diff for the buffer sweep")
     parser.add_argument("--projection-buffer-sweep", action="store_true", help="Compare one and two K pipeline stages at N=1024, K window 512")
+    parser.add_argument("--projection-mk-compare", action="store_true", help="Compare vLLM-style 4x7 M/K projection at N=1024")
     parser.add_argument("--projection-m-tile-sweep", action="store_true", help="Compare M16/K512 and M256/K128 at N=4096")
     parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
     parser.add_argument("--batch-coefficients", action="store_true", help="Compare per-token and batched SIMT coefficient generation")
@@ -296,6 +337,11 @@ def main():
         parser.error("--ablate-deferred-s2 requires --ablate-k512 without a projection profile or sweep")
     if args.ablate_k512 and (not args.ablate_m_only or args.projection_k_sweep):
         parser.error("--ablate-k512 requires --ablate-m-only without --projection-k-sweep")
+    if args.projection_mk_compare and (
+        not args.ablate_m_only or args.projection_k_sweep or args.projection_buffer_sweep
+        or args.profile_projection or args.ablate_k512 or args.projection_m_tile_sweep
+    ):
+        parser.error("--projection-mk-compare requires --ablate-m-only without other ablation options")
     if args.projection_m_tile_sweep and (
         not args.ablate_m_only or args.projection_k_sweep or args.projection_buffer_sweep
         or args.profile_projection or args.ablate_k512
@@ -321,7 +367,7 @@ def main():
         writer = csv.writer(output)
         writer.writerow(("batch", "hidden", "projection", "stage", "median_us", "launches_per_event", "sinkhorn_iters", "sinkhorn_eps"))
         cases = ((1024, 2560), (4096, 2560)) if args.ablate_m_only else CASES
-        if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection:
+        if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection or args.projection_mk_compare:
             cases = cases[:1]
         if args.projection_m_tile_sweep:
             cases = cases[-1:]
@@ -335,7 +381,7 @@ def main():
                 continue
             iters, eps = (1, 0.02) if args.tileops_spec or args.ablate_m_only else (20, 1e-6)
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, iters, eps)
-            expected = None if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection or args.projection_m_tile_sweep else pre_reference(*inputs)
+            expected = None if args.projection_k_sweep or args.projection_buffer_sweep or args.profile_projection or args.projection_m_tile_sweep or args.projection_mk_compare else pre_reference(*inputs)
             if args.ablate_m_only:
                 ablate_m_only(writer, torch, args, inputs, expected, batch, hidden)
                 output.flush()

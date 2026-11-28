@@ -464,9 +464,9 @@ def project_cube_fused(
 @T.macro
 def _m_only_k_window(
     x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
-    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares,
+    vector_m, part, batch, half, cols, chunk, mad_k, splits, compute_squares, accumulate_squares, k_base=0,
 ):
-    k = part * chunk
+    k = k_base + part * chunk
     # The tail load zero-pads any rows outside the real batch.
     T.copy(x[vector_m:vector_m + half, k:k + chunk], x_ub)
     T.copy(phi[k:k + chunk, 0:cols], b_l1)
@@ -532,7 +532,7 @@ def project_cube_m_only(
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
     alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
     projection_only: bool = False, k_pipeline_stages: int = 1, a_ping_pong: bool = False, compute_squares: bool = True,
-    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0,
+    accumulate_squares: bool = False, batch_coefficients: bool = False, rows: int = 16, mad_k_override: int = 0, split_k: int = 0,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     assert not batch_coefficients or (accumulate_squares and not debug and not projection_only)
@@ -541,7 +541,11 @@ def project_cube_m_only(
     assert rows == 16 or (rows == 256 and chunk == 128 and projection_only)
     half = rows // 2
     cols = 32
-    splits = width // chunk
+    if split_k:
+        assert projection_only and accumulate_squares and not a_ping_pong
+        assert split_k % chunk == 0 and width % chunk == 0
+    shards = (width + split_k - 1) // split_k if split_k else 1
+    splits = (split_k if split_k else width) // chunk
     assert not a_ping_pong or splits % 2 == 0
     # L0C requires a zero-origin region. Bound L0A by splitting K, not M,
     # so the full M tile can accumulate into one compact L0C tile.
@@ -551,13 +555,14 @@ def project_cube_m_only(
     mad_k = 32 if mad_k_override == 32 else min(chunk, 64 if rows == 256 else 256)
     assert chunk % mad_k == 0
     row_tiles = (batch + rows - 1) // rows
-    cores = min(row_tiles, 28)
+    jobs = row_tiles * shards
+    cores = min(jobs, 28)
     x: T.Tensor[(batch, width), T.bfloat16]
     phi: T.Tensor[(width, 24), T.float32]
     bias: T.Tensor[(24,), T.float32]
     h_post: T.Tensor[(batch, 4), T.float32]
 
-    trace: T.Tensor[(batch, 32 if debug or projection_only else 24 if coefficients_only else 4), T.float32]
+    trace: T.Tensor[(shards * batch, 32 if debug or projection_only else 24 if coefficients_only else 4), T.float32]
     hidden = width // 4
     x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
     x_layer: T.Tensor[(batch, hidden), T.bfloat16]
@@ -592,9 +597,19 @@ def project_cube_m_only(
         streams = T.reshape(x, (batch, 4, hidden))
 
         T.set_hf32_mode("nearest_even")
-        for row_tile in T.Persistent([row_tiles], cores, core):
-            vector_m = row_tile * rows + side * half
-            if a_ping_pong:
+        for job in T.Persistent([jobs], cores, core):
+            shard = job // row_tiles
+            vector_m = job % row_tiles * rows + side * half
+            if split_k:
+                k_base = shard * split_k
+                window_count = T.min(splits, (width - k_base) // chunk)
+                for part in T.Pipelined(window_count, num_stages=k_pipeline_stages):
+                    _m_only_k_window(
+                        x, phi, x_ub, nz_ub, squares_ub, a_l1, b_l1, a_l0, b_l0, acc,
+                        vector_m, part, batch, half, cols, chunk, mad_k, window_count,
+                        compute_squares, accumulate_squares, k_base,
+                    )
+            elif a_ping_pong:
                 # Each call names its own A buffer so the scheduler can track slot reuse.
                 for window_pair in T.Pipelined(splits // 2, num_stages=k_pipeline_stages):
                     _m_only_k_window(
@@ -663,9 +678,9 @@ def project_cube_m_only(
                                         value += squares_ub[part, row, 0]
                                 sum_ub[0, lane] = value
                     if debug or projection_only:
-                        T.copy(raw_ub[row, 0:24], trace[token, 0:24])
+                        T.copy(raw_ub[row, 0:24], trace[shard * batch + token, 0:24])
                         if compute_squares:
-                            T.copy(sum_ub[0, 0:8], trace[token, 24:32])
+                            T.copy(sum_ub[0, 0:8], trace[shard * batch + token, 24:32])
                     if not projection_only:
                         _compute_weights(
                             raw_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,
