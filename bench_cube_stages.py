@@ -66,36 +66,55 @@ def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
     post = bias.new_empty((batch, 4))
     weights = bias.new_empty((batch, 24))
     projection = bias.new_empty((batch, 32))
-    full = _compile("project_cube_m_only", **config)
-    project = _compile("project_cube_m_only", **config, projection_only=True)
-    ablated = _compile("project_cube_m_only", **config, coefficients_only=True)
+    if args.projection_k_sweep:
+        flat = x.float()
+        expected_projection = flat @ phi
+        expected_squares = flat.square().sum(-1)
 
-    def run_full():
-        full(x, phi, bias, post, residual, layer, post)
+        def prepare(chunk):
+            kernel = _compile("project_cube_m_only", **(config | {"chunk": chunk}), projection_only=True)
 
-    def run_ablated():
-        ablated(x, phi, bias, post, residual, layer, weights)
+            def run():
+                kernel(x, phi, bias, post, residual, layer, projection)
 
-    def run_project():
-        project(x, phi, bias, post, residual, layer, projection)
+            run()
+            torch.testing.assert_close(projection[:, :24], expected_projection, atol=0.01, rtol=0.01)
+            torch.testing.assert_close(projection[:, 24], expected_squares, atol=0.01, rtol=0.01)
+            return run
 
-    run_full()
-    torch.testing.assert_close((residual.flatten(1), layer, post), expected, atol=0.01, rtol=0.01)
-    run_ablated()
-    streams = x.float().view(batch, 4, hidden)
-    rebuilt_residual = torch.bmm(weights[:, 4:20].reshape(batch, 4, 4), streams).flatten(1).bfloat16()
-    rebuilt_layer = torch.bmm(weights[:, None, :4], streams).squeeze(1).bfloat16()
-    torch.testing.assert_close((rebuilt_residual, rebuilt_layer, post), expected, atol=0.01, rtol=0.01)
+        variants = tuple((f"projection_k{chunk}", prepare(chunk)) for chunk in (256, 512))
+    else:
+        full = _compile("project_cube_m_only", **config)
+        project = _compile("project_cube_m_only", **config, projection_only=True)
+        ablated = _compile("project_cube_m_only", **config, coefficients_only=True)
 
-    run_project()
-    flat = streams.flatten(1)
-    torch.testing.assert_close(projection[:, :24], flat @ phi, atol=0.01, rtol=0.01)
-    torch.testing.assert_close(projection[:, 24], flat.square().sum(-1), atol=0.01, rtol=0.01)
+        def run_full():
+            full(x, phi, bias, post, residual, layer, post)
 
-    variants = (("full_pre", run_full), ("coefficients_only", run_ablated), ("projection_only", run_project))
+        def run_ablated():
+            ablated(x, phi, bias, post, residual, layer, weights)
+
+        def run_project():
+            project(x, phi, bias, post, residual, layer, projection)
+
+        run_full()
+        torch.testing.assert_close((residual.flatten(1), layer, post), expected, atol=0.01, rtol=0.01)
+        run_ablated()
+        streams = x.float().view(batch, 4, hidden)
+        rebuilt_residual = torch.bmm(weights[:, 4:20].reshape(batch, 4, 4), streams).flatten(1).bfloat16()
+        rebuilt_layer = torch.bmm(weights[:, None, :4], streams).squeeze(1).bfloat16()
+        torch.testing.assert_close((rebuilt_residual, rebuilt_layer, post), expected, atol=0.01, rtol=0.01)
+
+        run_project()
+        flat = streams.flatten(1)
+        torch.testing.assert_close(projection[:, :24], flat @ phi, atol=0.01, rtol=0.01)
+        torch.testing.assert_close(projection[:, 24], flat.square().sum(-1), atol=0.01, rtol=0.01)
+
+        variants = (("full_pre", run_full), ("coefficients_only", run_ablated), ("projection_only", run_project))
     samples = defaultdict(list)
     count = args.launches_per_event
-    for order in permutations(variants):
+    orders = tuple(permutations(variants))
+    for order in orders * (2 if args.projection_k_sweep else 1):
         for name, run in order:
             def submit():
                 for _ in range(count):
@@ -114,6 +133,7 @@ def main():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--simd-reduce", action="store_true", help="Compare baseline and SIMD partial reduction")
     parser.add_argument("--ablate-m-only", action="store_true", help="Compare full Pre, coefficients, and projection at N=1024 and 4096")
+    parser.add_argument("--projection-k-sweep", action="store_true", help="Compare projection-only K windows at N=1024")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
     parser.add_argument("--launches-per-event", type=int, default=1,
@@ -122,6 +142,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.projection_k_sweep and not args.ablate_m_only:
+        parser.error("--projection-k-sweep requires --ablate-m-only")
     if args.ablate_m_only and (args.batch is not None or args.simd_reduce):
         parser.error("--ablate-m-only uses its own cases and cannot be combined with --simd-reduce")
     if min(args.warmup, args.repeat, args.launches_per_event) < 1:
@@ -140,6 +162,8 @@ def main():
         writer = csv.writer(output)
         writer.writerow(("batch", "hidden", "projection", "stage", "median_us", "launches_per_event", "sinkhorn_iters", "sinkhorn_eps"))
         cases = ((1024, 2560), (4096, 2560)) if args.ablate_m_only else CASES
+        if args.projection_k_sweep:
+            cases = cases[:1]
         for batch, hidden in cases:
             width = 4 * hidden
             x = torch.randn(batch, width, generator=rng).to(device, torch.bfloat16)
@@ -150,7 +174,7 @@ def main():
                 continue
             iters, eps = (1, 0.02) if args.tileops_spec or args.ablate_m_only else (20, 1e-6)
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, iters, eps)
-            expected = pre_reference(*inputs)
+            expected = None if args.projection_k_sweep else pre_reference(*inputs)
             if args.ablate_m_only:
                 ablate_m_only(writer, torch, args, inputs, expected, batch, hidden)
                 output.flush()

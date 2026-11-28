@@ -463,6 +463,7 @@ def project_cube_m_only(
     half = rows // 2
     cols = 32
     splits = width // chunk
+    mad_k = min(chunk, 256)
     row_tiles = (batch + rows - 1) // rows
     cores = min(row_tiles, 28)
     x: T.Tensor[(batch, width), T.bfloat16]
@@ -482,8 +483,8 @@ def project_cube_m_only(
         squares_ub = T.alloc_shared((splits, half, 8), T.float32)
         a_l1 = T.alloc_l1((rows, chunk), T.float32)
         b_l1 = T.alloc_l1((chunk, cols), T.float32)
-        a_l0 = T.alloc_l0a((rows, chunk), T.float32)
-        b_l0 = T.alloc_l0b((cols, chunk), T.float32)
+        a_l0 = T.alloc_l0a((rows, mad_k), T.float32)
+        b_l0 = T.alloc_l0b((cols, mad_k), T.float32)
         acc = T.alloc_l0c((rows, cols), T.float32)
 
         raw_ub = T.alloc_shared((half, cols), T.float32)
@@ -532,13 +533,24 @@ def project_cube_m_only(
                                 S.vsstb(zero, ptr, nz_stride, full)
                 # Both Vector halves publish their rows to the same Cube L1 tile.
                 T.dual_copy(nz_ub[0:half, 0:chunk], a_l1)
-                T.copy(a_l1, a_l0)
-                T.copy(b_l1, b_l0, transpose=True)
-                # Keep L0C live through intermediate MADs and release it for the final Fixpipe copy.
-                T.gemm(
-                    a_l0, b_l0, acc, transpose_B=True, clear_accum=part == 0,
-                    unit_flag_ctrl=T.Select(part == splits - 1, 3, 2),
-                )
+                if chunk == mad_k:
+                    T.copy(a_l1, a_l0)
+                    T.copy(b_l1, b_l0, transpose=True)
+                    # Keep L0C live through intermediate MADs and release it for the final Fixpipe copy.
+                    T.gemm(
+                        a_l0, b_l0, acc, transpose_B=True, clear_accum=part == 0,
+                        unit_flag_ctrl=T.Select(part == splits - 1, 3, 2),
+                    )
+                else:
+                    for mad in T.serial(chunk // mad_k):
+                        offset = mad * mad_k
+                        T.copy(a_l1[:, offset:offset + mad_k], a_l0)
+                        T.copy(b_l1[offset:offset + mad_k, :], b_l0, transpose=True)
+                        T.gemm(
+                            a_l0, b_l0, acc, transpose_B=True,
+                            clear_accum=(part == 0) & (mad == 0),
+                            unit_flag_ctrl=T.Select((part == splits - 1) & (mad == chunk // mad_k - 1), 3, 2),
+                        )
             T.dual_copy(acc, raw_ub, unit_flag_ctrl=3)
             T.copy(bias, bias_ub)
             for row in T.serial(T.min(T.max(batch - vector_m, 0), half)):
