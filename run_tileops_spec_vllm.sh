@@ -11,7 +11,11 @@ case "${2:-all}" in
     profile-b4) modes=(profile); projection=cube_full; label=tileops-spec ;;
     tileops-dispatch-b4) modes=(sweep); projection=cube_full; label=tileops-spec-dispatch-b4 ;;
     sweep-b4) modes=(sweep); projection=cube_full; label=tileops-spec ;;
-    validate-manifest) modes=(1 2 3 4); projection=cube_full; label="tileops-manifest-card$card-$(date +%Y%m%d-%H%M%S)-$$" ;;
+    validate-manifest)
+        modes=(1 2 3 4)
+        projection="${FGW_MHC_MANIFEST_PROJECTION:-cube_full}"
+        label="${FGW_MHC_TIMING_PREFIX:-tileops-manifest-card$card-$(date +%Y%m%d-%H%M%S)-$$}"
+        ;;
     validate-b4) modes=(1 2 3 4); projection=cube_full; label="tileops-spec-validate-b4-card$card-$(date +%Y%m%d-%H%M%S)-$$" ;;
     allocator-ab-b4) modes=(sweep); projection=cube_full; label=tileops-spec-allocator-ab-b4 ;;
     allocate-b4) modes=(sweep); projection=cube_full; label=tileops-spec-allocate-b4 ;;
@@ -41,6 +45,10 @@ done
 validate=false
 if [[ "$requested_mode" == validate-b4 || "$requested_mode" == validate-manifest ]]; then
     validate=true
+fi
+local_only=false
+if [[ "$requested_mode" == validate-manifest && "${FGW_MHC_MANIFEST_LOCAL_ONLY:-0}" == 1 ]]; then
+    local_only=true
 fi
 validation_csvs=()
 for mode in "${modes[@]}"; do
@@ -121,13 +129,13 @@ for mode in "${modes[@]}"; do
             "${common[@]}" "${tilelang_args[@]}" "${tilelang_output[@]}"
     }
     vllm_first=false
-    if [[ "$validate" == true ]] && (( round % 2 == 0 )); then
+    if [[ "$validate" == true ]] && [[ "$local_only" == false ]] && (( round % 2 == 0 )); then
         vllm_first=true
     fi
     if [[ "$mode" != tiling && "$vllm_first" == false ]]; then
         run_tilelang
     fi
-    if [[ "$mode" != large-m-only ]]; then
+    if [[ "$mode" != large-m-only && "$local_only" == false ]]; then
         cann_env=()
         vllm_args=("${common[@]}" "${vllm_output[@]}")
         if [[ "$mode" == tiling ]]; then
@@ -173,6 +181,10 @@ for mode in "${modes[@]}"; do
         continue
     fi
     if [[ "$mode" == sweep ]]; then
+        if [[ "$local_only" == true ]]; then
+            cat "$prefix-tilelang.csv"
+            continue
+        fi
         cat "$prefix-tilelang.csv" "$prefix-vllm.csv"
         if [[ "${2:-all}" == allocator-ab-b4 ]]; then
             python - "$prefix-tilelang.csv" "$prefix-vllm.csv" <<'PY'
@@ -233,7 +245,7 @@ PY
     cat "$prefix-results.csv"
 done
 
-if [[ "$validate" == true ]]; then
+if [[ "$validate" == true && "$local_only" == false ]]; then
     python - "${validation_csvs[@]}" <<'PY'
 import csv
 from statistics import mean, median

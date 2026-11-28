@@ -242,9 +242,9 @@ def main():
         parser.error("pair counts must be positive")
     if args.verify_b4_stream and (
         args.backend != "tilelang" or args.batch not in (None, 4) or not args.sweep_pairs
-        or args.projection != "cube_full" or args.full_h_double_post
+        or args.projection not in ("cube_full", "tileops_tuned") or args.full_h_double_post
     ):
-        parser.error("--verify-mhc-stream requires a TileLang cube_full sweep with default Post")
+        parser.error("--verify-mhc-stream requires a TileLang manifest sweep with default Post")
     if args.allocator_ab_b4 and (
         args.backend != "tilelang" or args.batch != 4 or not args.sweep_pairs
         or args.projection != "cube_full" or args.compare_fresh_b4 or args.full_h_double_post
