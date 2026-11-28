@@ -56,9 +56,10 @@ def replay_stage_times(run, torch, warmup, repeat, launches_per_event):
     return stages
 
 
-def profile_projection(run, torch, profiler, directory, warmup, launches):
+def profile_projection(run, torch, profiler, directory, warmup, launches, *, warmup_run=None):
+    warmup_run = run if warmup_run is None else warmup_run
     for _ in range(warmup):
-        run()
+        warmup_run()
     torch.npu.synchronize()
     directory.mkdir(parents=True, exist_ok=True)
     with profiler.profile(
@@ -92,6 +93,13 @@ def profile_projection(run, torch, profiler, directory, warmup, launches):
                 values = [float(row[metric]) for row in rows if row.get(metric, "").strip() not in ("", "N/A", "-")]
                 if values:
                     summaries.append(f"{metric}={median(values):.3f}")
+            if warmup_run is not run and len(rows) > 1:
+                rows.sort(key=lambda row: float(row["Start Time(us)"]))
+                for metric in ("Duration(us)", "aiv_mte2_time(us)"):
+                    values = [row.get(metric, "").strip() for row in rows]
+                    if all(value not in ("", "N/A", "-") for value in values):
+                        print(f"{directory.name} Pre {metric}: first={float(values[0]):.3f}, "
+                              f"subsequent_median={median(map(float, values[1:])):.3f}", flush=True)
             if summaries:
                 print(f"{directory.name} Pre device medians ({len(rows)} rows): " + ", ".join(summaries), flush=True)
         print(f"Pipe profiler report: {path}", flush=True)
@@ -110,24 +118,35 @@ def profile_pre_context(writer, torch, args, inputs, layer_out, expected, batch,
     def pre():
         return mhc_pre(*inputs, projection="cube_m_only_k512_batched")
 
-    def pair():
+    def run_post(residual, post, cache):
+        return mhc_post(
+            layer_out, post, residual, post_tile=hidden, pipeline=True,
+            pipeline_depth=2, output_cache=cache,
+        )
+
+    def pair(cache):
         residual, _, post = pre()
-        return mhc_post(layer_out, post, residual, post_tile=hidden, pipeline=True, pipeline_depth=2)
+        return run_post(residual, post, cache)
 
     residual, layer, post = pre()
     torch.testing.assert_close((residual, layer, post), expected, atol=0.01, rtol=0.01)
-    torch.testing.assert_close(
-        mhc_post(layer_out, post, residual, post_tile=hidden, pipeline=True, pipeline_depth=2),
-        post_reference(layer_out, post, residual), atol=0.01, rtol=0.01,
-    )
+    expected_post = post_reference(layer_out, post, residual)
+    caches = ("normal_fv", "notalloc_ci") if args.compare_post_cache else ("normal_fv",)
+    for cache in caches:
+        torch.testing.assert_close(run_post(residual, post, cache), expected_post, atol=0.01, rtol=0.01)
 
-    variants = (("standalone_pre", pre), ("continuous_pair", pair))
+    variants = (("standalone_pre", pre), ("continuous_pair", lambda: pair("normal_fv")))
+    if args.compare_post_cache:
+        variants += (("continuous_pair_notalloc_ci", lambda: pair("notalloc_ci")),)
     count = args.launches_per_event
     for phase in ("before", "after"):
         if phase == "after":
             for name, run in variants:
-                profile_projection(run, torch, profiler, args.profile_pre_context / name, args.warmup, max(8, count))
-        for name, run in variants:
+                profile_projection(
+                    run, torch, profiler, args.profile_pre_context / name, args.warmup,
+                    max(8, count), warmup_run=pre if args.compare_post_cache else None,
+                )
+        for name, run in (variants if phase == "before" else variants[::-1]):
             def submit():
                 for _ in range(count - 1):
                     run()
@@ -388,6 +407,7 @@ def main():
     parser.add_argument("--compare-weight-layout", action="store_true", help="Compare KxN and prepacked NxK projection weights")
     parser.add_argument("--compare-block-nz", action="store_true", help="Compare fused NZ and vLLM-style block gather")
     parser.add_argument("--compare-separate-nz", action="store_true", help="Compare fused and separate AIV NZ conversion")
+    parser.add_argument("--compare-post-cache", action="store_true", help="Compare Post L2 store policies in the Pre context profile")
     parser.add_argument("--profile-pre-context", type=Path, help="Compare isolated and paired Pre pipeline utilization at N=4096")
     parser.add_argument("--profile-projection", type=Path, help="Capture K512 projection pipe utilization at N=1024")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
@@ -398,6 +418,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.compare_post_cache and not args.profile_pre_context:
+        parser.error("--compare-post-cache requires --profile-pre-context")
     if args.profile_pre_context and (args.batch is not None or args.ablate_m_only or args.simd_reduce):
         parser.error("--profile-pre-context selects its own N=4096 workload")
     if args.accumulate_squares and not args.profile_projection:

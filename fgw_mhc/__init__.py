@@ -170,7 +170,7 @@ def mhc_pre(
 
 
 def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, streams_per_task=4,
-             post_tile=None, pipeline_depth=3):
+             post_tile=None, pipeline_depth=3, output_cache="normal_fv"):
     """Return the flattened BF16 residual plus the scaled layer output."""
     batch, hidden = _check_input(x_layer_out)
     device = x_layer_out.device
@@ -189,6 +189,8 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
         raise ValueError("post_tile must be a multiple of 64 between 64 and 4096")
     if type(pipeline_depth) is not int or pipeline_depth not in (2, 3):
         raise ValueError("pipeline_depth must be 2 or 3")
+    if output_cache not in ("normal_fv", "notalloc_ci"):
+        raise ValueError("output_cache must be normal_fv or notalloc_ci")
     out = torch.empty_like(x_res)
     if not out.numel():
         return out
@@ -202,7 +204,7 @@ def mhc_post(x_layer_out, h_post, x_res, *, pipeline=False, num_vec_cores=56, st
     stages = pipeline_depth if pipeline and jobs > cores else 0
     kernel = _compile(
         "post", batch=batch, hidden=hidden, tile=tile, cores=cores, stages=stages,
-        streams=group_width, total_streams=streams,
+        streams=group_width, total_streams=streams, output_cache=output_cache,
     )
     kernel(x_layer_out, h_post, x_res.view(batch, streams, hidden), out.view(batch, streams, hidden))
     return out
