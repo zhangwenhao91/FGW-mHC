@@ -53,10 +53,56 @@ def replay_stage_times(run, torch, warmup, repeat, launches_per_event):
     return stages
 
 
+def ablate_m_only(writer, torch, args, inputs, expected, batch, hidden):
+    from fgw_mhc import _compile
+
+    phi, x, bias = inputs[:3]
+    width = 4 * hidden
+    config = dict(batch=batch, width=width, chunk=math.gcd(width, 256), tile=hidden,
+                  repeat=1, eps=0.02, alpha_pre=1.0, alpha_post=1.0, alpha_res=1.0)
+    residual = x.new_empty((batch, 4, hidden))
+    layer = x.new_empty((batch, hidden))
+    post = bias.new_empty((batch, 4))
+    weights = bias.new_empty((batch, 24))
+    full = _compile("project_cube_m_only", **config)
+    ablated = _compile("project_cube_m_only", **config, coefficients_only=True)
+
+    def run_full():
+        full(x, phi, bias, post, residual, layer, post)
+
+    def run_ablated():
+        ablated(x, phi, bias, post, residual, layer, weights)
+
+    run_full()
+    torch.testing.assert_close((residual.flatten(1), layer, post), expected, atol=0.01, rtol=0.01)
+    run_ablated()
+    streams = x.float().view(batch, 4, hidden)
+    rebuilt_residual = torch.bmm(weights[:, 4:20].reshape(batch, 4, 4), streams).flatten(1).bfloat16()
+    rebuilt_layer = torch.bmm(weights[:, None, :4], streams).squeeze(1).bfloat16()
+    torch.testing.assert_close((rebuilt_residual, rebuilt_layer, post), expected, atol=0.01, rtol=0.01)
+
+    variants = (("full_pre", run_full), ("coefficients_only", run_ablated))
+    samples = defaultdict(list)
+    count = args.launches_per_event
+    for order in (variants, variants[::-1], variants, variants[::-1]):
+        for name, run in order:
+            def submit():
+                for _ in range(count):
+                    run()
+
+            duration = time_us(submit, torch, args.warmup, args.repeat) / count
+            samples[name].append(duration)
+            writer.writerow((batch, hidden, "cube_m_only", name, f"{duration:.3f}", count, 1, 0.02))
+    for name, values in samples.items():
+        print(f"N={batch} H={hidden} {name}: median {median(values):.3f} us, "
+              f"range {min(values):.3f}–{max(values):.3f} us", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--simd-reduce", action="store_true", help="Compare baseline and SIMD partial reduction")
+    parser.add_argument("--ablate-m-only", action="store_true", help="Compare full Pre and coefficients-only at N=1024 and 4096")
     parser.add_argument("--batch", type=int, choices=[batch for batch, _ in CASES])
     parser.add_argument("--tileops-spec", action="store_true", help="Use 1 Sinkhorn iteration and epsilon 0.02")
     parser.add_argument("--launches-per-event", type=int, default=1,
@@ -65,6 +111,8 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", default="cube-stage-results.csv")
     args = parser.parse_args()
+    if args.ablate_m_only and (args.batch is not None or args.simd_reduce):
+        parser.error("--ablate-m-only uses its own cases and cannot be combined with --simd-reduce")
     if min(args.warmup, args.repeat, args.launches_per_event) < 1:
         parser.error("warmup, repeat and launches per event must be positive")
 
@@ -80,7 +128,8 @@ def main():
     with open(args.output, "w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output)
         writer.writerow(("batch", "hidden", "projection", "stage", "median_us", "launches_per_event", "sinkhorn_iters", "sinkhorn_eps"))
-        for batch, hidden in CASES:
+        cases = ((1024, 2560), (4096, 2560)) if args.ablate_m_only else CASES
+        for batch, hidden in cases:
             width = 4 * hidden
             x = torch.randn(batch, width, generator=rng).to(device, torch.bfloat16)
             phi = (torch.randn(width, 24, generator=rng) / math.sqrt(width)).to(device)
@@ -88,9 +137,13 @@ def main():
             layer_out = torch.randn(batch, hidden, generator=rng).to(device, torch.bfloat16)
             if args.batch is not None and batch != args.batch:
                 continue
-            iters, eps = (1, 0.02) if args.tileops_spec else (20, 1e-6)
+            iters, eps = (1, 0.02) if args.tileops_spec or args.ablate_m_only else (20, 1e-6)
             inputs = (phi, x, bias, 1.0, 1.0, 1.0, iters, eps)
             expected = pre_reference(*inputs)
+            if args.ablate_m_only:
+                ablate_m_only(writer, torch, args, inputs, expected, batch, hidden)
+                output.flush()
+                continue
 
             routes = ("cube_full", "cube_full_simd_reduce") if args.simd_reduce else ("cube", "cube_mk", "cube_full")
             for projection in routes:

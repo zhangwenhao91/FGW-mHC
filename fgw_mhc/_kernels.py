@@ -455,7 +455,7 @@ def project_cube_fused(
 def project_cube_m_only(
     x, phi, bias, h_post, x_res, x_layer, trace, *,
     batch: int, width: int, chunk: int, tile: int, repeat: int, eps: float,
-    alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False,
+    alpha_pre: float, alpha_post: float, alpha_res: float, debug: bool = False, coefficients_only: bool = False,
 ):
     """Give one Cube group each M tile and accumulate all K locally."""
     rows = 16
@@ -469,7 +469,7 @@ def project_cube_m_only(
     bias: T.Tensor[(24,), T.float32]
     h_post: T.Tensor[(batch, 4), T.float32]
 
-    trace: T.Tensor[(batch, 32 if debug else 4), T.float32]
+    trace: T.Tensor[(batch, 32 if debug else 24 if coefficients_only else 4), T.float32]
     hidden = width // 4
     x_res: T.Tensor[(batch, 4, hidden), T.bfloat16]
     x_layer: T.Tensor[(batch, hidden), T.bfloat16]
@@ -556,12 +556,15 @@ def project_cube_m_only(
                     raw_ub, sum_ub, bias_ub, totals, weights_ub, post_ub, totals,
                     width, 1, repeat, eps, alpha_pre, alpha_post, alpha_res, True, True, False, row,
                 )
-                for column_tile in T.serial(hidden // tile):
-                    offset = column_tile * tile
-                    T.copy(streams[token, 0, offset], streams_ub)
-                    _apply_weights(streams_ub, weights_ub, res_ub, layer_ub, tile, 4)
-                    T.copy(res_ub, x_res[token, 0, offset])
-                    T.copy(layer_ub, x_layer[token, offset])
+                if coefficients_only:
+                    T.copy(weights_ub, trace[token, 0:24])
+                else:
+                    for column_tile in T.serial(hidden // tile):
+                        offset = column_tile * tile
+                        T.copy(streams[token, 0, offset], streams_ub)
+                        _apply_weights(streams_ub, weights_ub, res_ub, layer_ub, tile, 4)
+                        T.copy(res_ub, x_res[token, 0, offset])
+                        T.copy(layer_ub, x_layer[token, offset])
                 T.copy(post_ub[0:4], h_post[token, 0])
 
 
